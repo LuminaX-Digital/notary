@@ -4,7 +4,7 @@ Private meeting notes for Mac. Notary listens to the sound your Mac plays, write
 
 Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates/gpui), the renderer behind the Zed editor, so it starts fast and uses no web view.
 
-> **Early development.** The core loop works: record, transcribe live in English and German, stop. Saving, microphone capture and summaries are in progress. See the status list below.
+> **Early development.** You can record, watch a live transcript in English and German, and come back to your saved meetings later. Summaries are not built yet. See the status list below.
 
 ## Status
 
@@ -13,8 +13,8 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 | Live transcript from system audio | Works |
 | English and German, language detected per phrase | Works |
 | Local model, no network use while recording | Works |
-| Saving meetings to disk | In progress |
-| Microphone (your own voice) | In progress |
+| Meetings saved on this Mac, with delete | Works |
+| Microphone (your own voice, macOS 15 or newer) | Built, needs more testing |
 | Summaries and "ask across meetings" | Planned |
 | Speaker names | Planned |
 | Windows and Linux | Not planned for v1 |
@@ -38,7 +38,15 @@ cargo run --release
 
 The model file is about 550 MB. Notary looks for it in `./models`, in `~/Library/Application Support/Notary/models`, or at the path in `NOTARY_MODEL`.
 
-On first use macOS asks for Screen Recording permission. Notary uses it only to hear the audio your Mac plays; it never captures the screen.
+On first use macOS asks for Screen Recording permission, and for microphone access on macOS 15 or newer. Notary uses them only to hear the audio your Mac plays and your own voice; it never captures the screen. Use headphones on calls so your microphone does not pick up the other side.
+
+## Package as an app
+
+```bash
+scripts/bundle.sh
+```
+
+This builds `dist/Notary.app` and `dist/Notary.dmg`, ad-hoc signed so it runs on your own Mac. Pass `SIGN_ID="Developer ID Application: ..."` to sign for distribution; the script's header lists the notarization commands.
 
 ## Privacy
 

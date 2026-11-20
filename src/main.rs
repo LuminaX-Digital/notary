@@ -4,7 +4,7 @@ mod store;
 mod theme;
 
 use data::{Meeting, Speaker, line};
-use engine::{Event, Recording};
+use engine::{Event, Recording, Source};
 use futures::StreamExt;
 use gpui::{
     AnyElement, App, Application, Bounds, Context, FontWeight, IntoElement, Render, ScrollHandle,
@@ -113,9 +113,19 @@ impl Notary {
     fn apply(&mut self, id: i64, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Loading => self.status = "Loading the model".into(),
-            Event::Listening => self.status = "Listening to your Mac's audio".into(),
-            Event::Segment { start, text } => {
-                let l = line(&clock(start), "Call audio", Speaker::Other, &text);
+            Event::Listening { mic } => {
+                self.status = if mic {
+                    "Listening to your Mac's audio and your microphone".into()
+                } else {
+                    "Listening to your Mac's audio (microphone needs macOS 15)".into()
+                };
+            }
+            Event::Segment { source, start, text } => {
+                let (name, who) = match source {
+                    Source::System => ("Call audio", Speaker::Other),
+                    Source::Mic => ("You", Speaker::Me),
+                };
+                let l = line(&clock(start), name, who, &text);
                 let saved = self.store.as_ref().map(|s| s.add_line(id, &l));
                 if let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) {
                     m.lines.push(l);
