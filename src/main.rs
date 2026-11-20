@@ -1,9 +1,10 @@
 mod data;
 mod engine;
 mod store;
+mod summarizer;
 mod theme;
 
-use data::{Meeting, Speaker, line};
+use data::{Action, Meeting, Speaker, line};
 use engine::{Event, Recording, Source};
 use futures::StreamExt;
 use gpui::{
@@ -17,6 +18,8 @@ use theme::Theme;
 const SANS: &str = ".SystemUIFont";
 const SERIF: &str = "Iowan Old Style";
 const MONO: &str = "Menlo";
+const DEFAULT_TITLE: &str = "New note";
+const MIN_WORDS_TO_SUMMARIZE: usize = 25;
 
 struct Notary {
     store: Option<Store>,
@@ -154,7 +157,99 @@ impl Notary {
                 if routine.iter().any(|p| self.status.starts_with(p)) {
                     self.status = "Saved on this Mac".into();
                 }
+                let words = self.meetings.iter().find(|m| m.id == id).map_or(0, |m| m.word_count());
+                if words >= MIN_WORDS_TO_SUMMARIZE && summarizer::model_path().is_some() {
+                    self.start_summary(id, cx);
+                }
             }
+        }
+        cx.notify();
+    }
+
+    fn start_summary(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) else { return };
+        if m.summarizing || m.live {
+            return;
+        }
+        if m.word_count() < MIN_WORDS_TO_SUMMARIZE {
+            self.status = "Too little was said to summarize".into();
+            cx.notify();
+            return;
+        }
+        let Some(model) = summarizer::model_path() else {
+            self.status = "Summary model not found. Put Qwen3-4B-Instruct-2507-Q4_K_M.gguf in ./models or set NOTARY_LLM.".into();
+            cx.notify();
+            return;
+        };
+        m.summarizing = true;
+        let transcript = m.transcript_text();
+        self.status = "Writing the summary on this Mac".into();
+        let rx = summarizer::summarize(model, transcript);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |this, cx| this.apply_notes(id, result, cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_notes(
+        &mut self,
+        id: i64,
+        result: Result<anyhow::Result<summarizer::Notes>, futures::channel::oneshot::Canceled>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.meetings.iter().position(|m| m.id == id) else { return };
+        self.meetings[index].summarizing = false;
+        match result {
+            Ok(Ok(notes)) => {
+                let rename = self.meetings[index].title.as_ref() == DEFAULT_TITLE;
+                let new_title = if rename { notes.title.as_deref() } else { None };
+                let ids = match &self.store {
+                    Some(store) => store.save_notes(id, new_title, &notes.sections, &notes.actions),
+                    None => Ok((0..notes.actions.len() as i64).map(|i| -(i + 1)).collect()),
+                };
+                let ids = match ids {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        self.status = format!("Could not save: {e:#}").into();
+                        cx.notify();
+                        return;
+                    }
+                };
+                let m = &mut self.meetings[index];
+                if let Some(t) = new_title {
+                    m.title = t.to_string().into();
+                }
+                m.summary = notes.sections.into_iter().map(|(t, b)| (t.into(), b.into())).collect();
+                m.actions = notes
+                    .actions
+                    .into_iter()
+                    .zip(ids)
+                    .map(|((label, owner), id)| Action { id, label: label.into(), owner: owner.into(), done: false })
+                    .collect();
+                self.status = "Summary ready".into();
+            }
+            Ok(Err(e)) => self.status = format!("{e:#}").into(),
+            Err(_) => self.status = "The summary was interrupted".into(),
+        }
+        cx.notify();
+    }
+
+    fn toggle_action(&mut self, meeting_id: i64, action_id: i64, cx: &mut Context<Self>) {
+        let Some(a) = self
+            .meetings
+            .iter_mut()
+            .find(|m| m.id == meeting_id)
+            .and_then(|m| m.actions.iter_mut().find(|a| a.id == action_id))
+        else {
+            return;
+        };
+        a.done = !a.done;
+        let done = a.done;
+        if let Some(store) = &self.store {
+            let result = store.set_action_done(action_id, done);
+            self.save(result);
         }
         cx.notify();
     }
@@ -457,41 +552,70 @@ impl Notary {
         let heading = |s: &'static str| {
             div().font_family(SERIF).text_size(px(14.)).text_color(rgb(t.ink)).child(s)
         };
-        let mut summary = div().flex().flex_col().gap(px(10.)).child(heading("Summary"));
-        if m.summary.is_empty() {
+        let meeting_id = m.id;
+        let can_summarize = !m.live && !m.summarizing && m.word_count() >= MIN_WORDS_TO_SUMMARIZE;
+        let summarize_button = div()
+            .id("summarize")
+            .px(px(9.))
+            .py(px(3.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .bg(rgb(t.rail))
+            .text_size(px(11.5))
+            .text_color(rgb(t.soft))
+            .hover(|h| h.text_color(rgb(t.accent)))
+            .on_click(cx.listener(move |this, _, _, cx| this.start_summary(meeting_id, cx)))
+            .child(if m.summary.is_empty() { "Summarize" } else { "Regenerate" });
+        let mut summary = div().flex().flex_col().gap(px(10.)).child(
+            div()
+                .flex()
+                .items_center()
+                .child(heading("Summary"))
+                .child(div().flex_1())
+                .when(can_summarize, |d| d.child(summarize_button)),
+        );
+        if m.summarizing || m.summary.is_empty() {
+            let placeholder = if m.summarizing {
+                "Writing the summary on this Mac. This takes a few seconds."
+            } else if m.live {
+                "The summary is written when you stop recording."
+            } else if m.word_count() < MIN_WORDS_TO_SUMMARIZE {
+                "Too little was said to summarize."
+            } else {
+                "Press Summarize to write notes from this transcript."
+            };
             summary = summary.child(
-                div()
-                    .text_size(px(13.))
-                    .line_height(px(20.))
-                    .text_color(rgb(t.faint))
-                    .child("Summaries arrive with the local language model, which is not built yet."),
+                div().text_size(px(13.)).line_height(px(20.)).text_color(rgb(t.faint)).child(placeholder),
             );
         }
-        for (lead, body) in &m.summary {
+        for (lead, body) in m.summary.iter().filter(|_| !m.summarizing) {
             summary = summary.child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(t.ink))
-                            .child(*lead),
-                    )
+                    .when(lead.as_ref() != "Summary", |d| {
+                        d.child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(t.ink))
+                                .child(lead.clone()),
+                        )
+                    })
                     .child(
                         div()
                             .text_size(px(13.5))
                             .line_height(px(21.))
                             .text_color(rgb(t.soft))
-                            .child(*body),
+                            .child(body.clone()),
                     ),
             );
         }
 
         let mut actions = div().flex().flex_col().gap(px(8.)).child(heading("Next steps"));
-        for a in &m.actions {
+        for a in m.actions.iter().filter(|_| !m.summarizing) {
+            let action_id = a.id;
             actions = actions.child(
                 div()
                     .flex()
@@ -505,9 +629,12 @@ impl Notary {
                     .border_color(rgb(t.line))
                     .child(
                         div()
+                            .id(("action", a.id as usize))
                             .mt(px(2.))
                             .size(px(15.))
                             .flex_none()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_action(meeting_id, action_id, cx)))
                             .rounded(px(4.))
                             .border_1()
                             .border_color(rgb(if a.done { t.accent } else { t.faint }))
@@ -520,7 +647,7 @@ impl Notary {
                             .text_size(px(13.))
                             .text_color(rgb(if a.done { t.faint } else { t.ink }))
                             .when(a.done, |d| d.line_through())
-                            .child(a.label),
+                            .child(a.label.clone()),
                     )
                     .child(
                         div()
@@ -530,7 +657,7 @@ impl Notary {
                             .bg(rgb(t.rail))
                             .text_size(px(11.))
                             .text_color(rgb(t.soft))
-                            .child(a.owner),
+                            .child(a.owner.clone()),
                     ),
             );
         }

@@ -1,6 +1,6 @@
 //! Meetings and transcripts, saved in a SQLite file on this Mac.
 
-use crate::data::{Line, Meeting, Speaker, line};
+use crate::data::{Action, Line, Meeting, Speaker, line};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
@@ -39,7 +39,22 @@ impl Store {
                 who INTEGER NOT NULL,
                 text TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS lines_meeting ON lines(meeting_id);",
+            CREATE INDEX IF NOT EXISTS lines_meeting ON lines(meeting_id);
+            CREATE TABLE IF NOT EXISTS sections (
+                id INTEGER PRIMARY KEY,
+                meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                pos INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS actions (
+                id INTEGER PRIMARY KEY,
+                meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                pos INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0
+            );",
         )?;
         Ok(Self { conn })
     }
@@ -63,9 +78,65 @@ impl Store {
                 let (ts, name, who, text) = l?;
                 lines.push(line(&ts, &name, Speaker::from_db(who), &text));
             }
-            meetings.push(Meeting::new(id, &title, started, false, lines));
+            let mut meeting = Meeting::new(id, &title, started, false, lines);
+
+            let mut ss = self
+                .conn
+                .prepare("SELECT title, body FROM sections WHERE meeting_id = ?1 ORDER BY pos")?;
+            for s in ss.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+                let (t, b) = s?;
+                meeting.summary.push((t.into(), b.into()));
+            }
+            let mut acts = self
+                .conn
+                .prepare("SELECT id, label, owner, done FROM actions WHERE meeting_id = ?1 ORDER BY pos")?;
+            for a in acts.query_map([id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?))
+            })? {
+                let (aid, label, owner, done) = a?;
+                meeting.actions.push(Action { id: aid, label: label.into(), owner: owner.into(), done });
+            }
+            meetings.push(meeting);
         }
         Ok(meetings)
+    }
+
+    /// Replaces the saved summary and next steps of a meeting. Returns the new next-step ids.
+    pub fn save_notes(
+        &self,
+        meeting_id: i64,
+        title: Option<&str>,
+        sections: &[(String, String)],
+        actions: &[(String, String)],
+    ) -> Result<Vec<i64>> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM sections WHERE meeting_id = ?1", params![meeting_id])?;
+        tx.execute("DELETE FROM actions WHERE meeting_id = ?1", params![meeting_id])?;
+        for (pos, (t, b)) in sections.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO sections (meeting_id, pos, title, body) VALUES (?1, ?2, ?3, ?4)",
+                params![meeting_id, pos as i64, t, b],
+            )?;
+        }
+        let mut ids = Vec::new();
+        for (pos, (label, owner)) in actions.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO actions (meeting_id, pos, label, owner) VALUES (?1, ?2, ?3, ?4)",
+                params![meeting_id, pos as i64, label, owner],
+            )?;
+            ids.push(tx.last_insert_rowid());
+        }
+        if let Some(t) = title {
+            tx.execute("UPDATE meetings SET title = ?2 WHERE id = ?1", params![meeting_id, t])?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    pub fn set_action_done(&self, action_id: i64, done: bool) -> Result<()> {
+        self.conn
+            .execute("UPDATE actions SET done = ?2 WHERE id = ?1", params![action_id, done])?;
+        Ok(())
     }
 
     pub fn create_meeting(&self, title: &str, started: i64) -> Result<i64> {

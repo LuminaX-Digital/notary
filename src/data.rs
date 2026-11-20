@@ -34,8 +34,9 @@ pub struct Line {
 }
 
 pub struct Action {
-    pub label: &'static str,
-    pub owner: &'static str,
+    pub id: i64,
+    pub label: SharedString,
+    pub owner: SharedString,
     pub done: bool,
 }
 
@@ -44,8 +45,9 @@ pub struct Meeting {
     pub title: SharedString,
     pub started: i64,
     pub live: bool,
+    pub summarizing: bool,
     pub lines: Vec<Line>,
-    pub summary: Vec<(&'static str, &'static str)>,
+    pub summary: Vec<(SharedString, SharedString)>,
     pub actions: Vec<Action>,
 }
 
@@ -69,10 +71,24 @@ impl Meeting {
             title: title.to_string().into(),
             started,
             live,
+            summarizing: false,
             lines,
             summary: Vec::new(),
             actions: Vec::new(),
         }
+    }
+
+    /// The spoken lines as "Name: text", the form the summary model reads. Typed notes are left out.
+    pub fn transcript_text(&self) -> String {
+        self.lines
+            .iter()
+            .filter(|l| l.who != Speaker::Note)
+            .map(|l| format!("{}: {}\n", l.name, l.text))
+            .collect()
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.lines.iter().map(|l| l.text.split_whitespace().count()).sum()
     }
 
     pub fn time(&self) -> SharedString {

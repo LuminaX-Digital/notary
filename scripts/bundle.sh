@@ -21,6 +21,7 @@ cargo build --release
 rm -rf dist
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/notary "$APP/Contents/MacOS/Notary"
+cp target/release/notary-llm "$APP/Contents/MacOS/notary-llm"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -52,6 +53,7 @@ cat > dist/entitlements.plist <<PLIST
 </plist>
 PLIST
 
+codesign --force --options runtime --sign "$SIGN_ID" "$APP/Contents/MacOS/notary-llm"
 codesign --force --options runtime --entitlements dist/entitlements.plist --sign "$SIGN_ID" "$APP"
 codesign --verify --strict --verbose=1 "$APP"
 

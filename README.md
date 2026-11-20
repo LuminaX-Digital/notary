@@ -4,7 +4,7 @@ Private meeting notes for Mac. Notary listens to the sound your Mac plays, write
 
 Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates/gpui), the renderer behind the Zed editor, so it starts fast and uses no web view.
 
-> **Early development.** You can record, watch a live transcript in English and German, and come back to your saved meetings later. Summaries are not built yet. See the status list below.
+> **Early development.** You can record, watch a live transcript in English and German, and come back to your saved meetings later. Search and "ask across meetings" are not built yet. See the status list below.
 
 ## Status
 
@@ -15,14 +15,15 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 | Local model, no network use while recording | Works |
 | Meetings saved on this Mac, with delete | Works |
 | Microphone (your own voice, macOS 15 or newer) | Built, needs more testing |
-| Summaries and "ask across meetings" | Planned |
+| Summaries, titles and next steps you can tick off, in English or German | Works |
+| "Ask across meetings" and search | Planned |
 | Speaker names | Planned |
 | Windows and Linux | Not planned for v1 |
 
 ## Requirements
 
 - Apple Silicon Mac, macOS 14.4 or newer
-- 8 GB of memory (the transcription model needs about 700 MB while recording)
+- 8 GB of memory (about 700 MB while recording, about 3 GB while a summary is written)
 - Rust 1.85 or newer and Xcode command line tools to build from source
 
 ## Build and run
@@ -33,10 +34,13 @@ cd notary
 mkdir -p models
 curl -L -o models/ggml-large-v3-turbo-q5_0.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+curl -L -o models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
+  https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+cargo build --release
 cargo run --release
 ```
 
-The model file is about 550 MB. Notary looks for it in `./models`, in `~/Library/Application Support/Notary/models`, or at the path in `NOTARY_MODEL`.
+The speech model is about 550 MB and the summary model about 2.5 GB. Notary looks for them in `./models`, in `~/Library/Application Support/Notary/models`, or at the paths in `NOTARY_MODEL` and `NOTARY_LLM`. Summaries run in a separate helper program (`notary-llm`) that starts only while a summary is written.
 
 On first use macOS asks for Screen Recording permission, and for microphone access on macOS 15 or newer. Notary uses them only to hear the audio your Mac plays and your own voice; it never captures the screen. Use headphones on calls so your microphone does not pick up the other side.
 
