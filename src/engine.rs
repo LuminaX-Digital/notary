@@ -15,6 +15,7 @@ const MIN_CHUNK: usize = 3 * SAMPLE_RATE;
 const MAX_CHUNK: usize = 10 * SAMPLE_RATE;
 const PAUSE: usize = SAMPLE_RATE * 4 / 10;
 const SILENCE_RMS: f32 = 0.003;
+const NO_SPEECH_MAX: f32 = 0.6;
 
 pub enum Event {
     Loading,
@@ -146,7 +147,9 @@ fn run(model: PathBuf, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -
             match audio_rx.recv_timeout(Duration::from_millis(150)) {
                 Ok(samples) => pending.extend(samples),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("Audio capture stopped unexpectedly. If you changed your sound output, press Record again.")
+                }
             }
             if stop.load(Ordering::Relaxed) {
                 stopping = true;
@@ -171,9 +174,12 @@ fn run(model: PathBuf, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -
             params.set_suppress_blank(true);
             state.full(params, &chunk)?;
             for segment in state.as_iter() {
+                if segment.no_speech_probability() > NO_SPEECH_MAX {
+                    continue;
+                }
                 let text = segment.to_string();
                 let text = text.trim();
-                if !text.is_empty() {
+                if text.chars().any(char::is_alphanumeric) {
                     let _ = events.unbounded_send(Event::Segment {
                         start: start + segment.start_timestamp() as f32 / 100.0,
                         text: text.to_string(),

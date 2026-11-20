@@ -10,5 +10,6 @@ anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 screencapturekit = { version = "11.1.2", features = ["macos_13_0"] }
 whisper-rs = { version = "0.16.0", features = ["metal"] }

@@ -1,14 +1,17 @@
 mod data;
 mod engine;
+mod store;
 mod theme;
 
-use data::{Meeting, Speaker, line, sample_meetings};
+use data::{Meeting, Speaker, line};
 use engine::{Event, Recording};
 use futures::StreamExt;
 use gpui::{
-    App, Application, Bounds, Context, FontWeight, IntoElement, Render, ScrollHandle, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, size,
+    AnyElement, App, Application, Bounds, Context, FontWeight, IntoElement, Render, ScrollHandle,
+    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px,
+    rgb, size,
 };
+use store::Store;
 use theme::Theme;
 
 const SANS: &str = ".SystemUIFont";
@@ -16,13 +19,14 @@ const SERIF: &str = "Iowan Old Style";
 const MONO: &str = "Menlo";
 
 struct Notary {
+    store: Option<Store>,
     meetings: Vec<Meeting>,
     selected: usize,
     recording: Option<Recording>,
     stopping: bool,
+    confirm_delete: Option<i64>,
     status: SharedString,
     scroll: ScrollHandle,
-    next_id: u64,
 }
 
 fn clock(secs: f32) -> String {
@@ -31,6 +35,33 @@ fn clock(secs: f32) -> String {
 }
 
 impl Notary {
+    fn new() -> Self {
+        let mut status: SharedString = "Ready".into();
+        let (store, meetings) = match Store::open().and_then(|s| s.load_meetings().map(|m| (s, m))) {
+            Ok((s, m)) => (Some(s), m),
+            Err(e) => {
+                status = format!("Meetings will not be saved: {e:#}").into();
+                (None, Vec::new())
+            }
+        };
+        Self {
+            store,
+            meetings,
+            selected: 0,
+            recording: None,
+            stopping: false,
+            confirm_delete: None,
+            status,
+            scroll: ScrollHandle::new(),
+        }
+    }
+
+    fn save<T>(&mut self, result: anyhow::Result<T>) {
+        if let Err(e) = result {
+            self.status = format!("Could not save: {e:#}").into();
+        }
+    }
+
     fn toggle_recording(&mut self, cx: &mut Context<Self>) {
         if let Some(rec) = &self.recording {
             if !self.stopping {
@@ -47,24 +78,21 @@ impl Notary {
             return;
         };
 
-        let id = self.next_id;
-        self.next_id += 1;
-        let now = chrono::Local::now();
-        self.meetings.insert(
-            0,
-            Meeting {
-                id,
-                title: "New note".into(),
-                when: now.format("%H:%M").to_string().into(),
-                sub: "Recording".into(),
-                meta: now.format("%a %b %-d \u{b7} %H:%M \u{b7} audio stays on this Mac").to_string().into(),
-                live: true,
-                lines: Vec::new(),
-                summary: Vec::new(),
-                actions: Vec::new(),
+        let started = chrono::Local::now().timestamp();
+        let id = match &self.store {
+            Some(store) => match store.create_meeting("New note", started) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.status = format!("Could not save: {e:#}").into();
+                    cx.notify();
+                    return;
+                }
             },
-        );
+            None => self.meetings.iter().map(|m| m.id).max().unwrap_or(0) + 1,
+        };
+        self.meetings.insert(0, Meeting::new(id, "New note", started, true, Vec::new()));
         self.selected = 0;
+        self.confirm_delete = None;
 
         let (rec, mut events) = engine::start(model);
         self.recording = Some(rec);
@@ -82,14 +110,18 @@ impl Notary {
         cx.notify();
     }
 
-    fn apply(&mut self, id: u64, event: Event, cx: &mut Context<Self>) {
+    fn apply(&mut self, id: i64, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Loading => self.status = "Loading the model".into(),
             Event::Listening => self.status = "Listening to your Mac's audio".into(),
             Event::Segment { start, text } => {
+                let l = line(&clock(start), "Call audio", Speaker::Other, &text);
+                let saved = self.store.as_ref().map(|s| s.add_line(id, &l));
                 if let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) {
-                    m.lines.push(line(&clock(start), "Call audio", Speaker::Other, &text));
-                    m.sub = format!("{} lines", m.lines.len()).into();
+                    m.lines.push(l);
+                }
+                if let Some(result) = saved {
+                    self.save(result);
                 }
                 self.scroll.scroll_to_bottom();
             }
@@ -103,14 +135,39 @@ impl Notary {
                 self.stopping = false;
                 if let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) {
                     m.live = false;
-                    m.sub = format!("{} lines \u{b7} just now", m.lines.len()).into();
+                }
+                if let Some(store) = &self.store {
+                    let result = store.finish(id, chrono::Local::now().timestamp());
+                    self.save(result);
                 }
                 let routine = ["Finishing", "Listening", "Loading"];
                 if routine.iter().any(|p| self.status.starts_with(p)) {
-                    self.status = "Saved in this session".into();
+                    self.status = "Saved on this Mac".into();
                 }
             }
         }
+        cx.notify();
+    }
+
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.meetings.get(self.selected) else { return };
+        if m.live {
+            return;
+        }
+        let id = m.id;
+        if self.confirm_delete != Some(id) {
+            self.confirm_delete = Some(id);
+            cx.notify();
+            return;
+        }
+        if let Some(store) = &self.store {
+            let result = store.delete_meeting(id);
+            self.save(result);
+        }
+        self.meetings.remove(self.selected);
+        self.selected = self.selected.min(self.meetings.len().saturating_sub(1));
+        self.confirm_delete = None;
+        self.status = "Meeting deleted".into();
         cx.notify();
     }
 
@@ -126,12 +183,7 @@ impl Notary {
             .bg(rgb(t.raised))
             .border_b_1()
             .border_color(rgb(t.line))
-            .child(
-                div()
-                    .text_size(px(13.))
-                    .text_color(rgb(t.soft))
-                    .child("Notary"),
-            )
+            .child(div().text_size(px(13.)).text_color(rgb(t.soft)).child("Notary"))
             .child(div().flex_1())
             .when(live, |bar| {
                 bar.child(
@@ -144,12 +196,7 @@ impl Notary {
                         .rounded_full()
                         .bg(rgb(t.rail))
                         .child(div().size(px(7.)).rounded_full().bg(rgb(t.record)))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(t.soft))
-                                .child("Recording"),
-                        ),
+                        .child(div().text_size(px(12.)).text_color(rgb(t.soft)).child("Recording")),
                 )
             })
             .child(
@@ -194,8 +241,22 @@ impl Notary {
     }
 
     fn list(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut items = div().flex().flex_col().px(px(6.)).pb(px(10.));
+        let mut items = div().id("meetings").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().px(px(6.)).pb(px(10.));
+        let mut last_day = String::new();
         for (i, m) in self.meetings.iter().enumerate() {
+            let day = m.day_label();
+            if day != last_day {
+                items = items.child(
+                    div()
+                        .px(px(8.))
+                        .pt(px(14.))
+                        .pb(px(4.))
+                        .text_size(px(11.))
+                        .text_color(rgb(t.faint))
+                        .child(day.to_uppercase()),
+                );
+                last_day = day;
+            }
             let active = i == self.selected;
             items = items.child(
                 div()
@@ -211,6 +272,7 @@ impl Notary {
                     .hover(|d| d.bg(rgb(if active { t.accent_soft } else { t.rail })))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected = i;
+                        this.confirm_delete = None;
                         cx.notify();
                     }))
                     .child(
@@ -232,7 +294,7 @@ impl Notary {
                                     .font_family(MONO)
                                     .text_size(px(11.))
                                     .text_color(rgb(t.faint))
-                                    .child(m.when.clone()),
+                                    .child(m.time()),
                             ),
                     )
                     .child(
@@ -240,7 +302,7 @@ impl Notary {
                             .truncate()
                             .text_size(px(12.))
                             .text_color(rgb(t.soft))
-                            .child(m.sub.clone()),
+                            .child(m.sub()),
                     ),
             );
         }
@@ -271,21 +333,38 @@ impl Notary {
                             .child("Search meetings, notes, transcript"),
                     ),
             )
-            .child(
-                div()
-                    .px(px(14.))
-                    .pt(px(14.))
-                    .pb(px(4.))
-                    .text_size(px(11.))
-                    .text_color(rgb(t.faint))
-                    .child("TODAY"),
-            )
             .child(items)
     }
 
-    fn view(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let m = &self.meetings[self.selected];
+    fn empty_body(&self, t: &Theme) -> AnyElement {
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(8.))
+            .px(px(40.))
+            .child(
+                div()
+                    .font_family(SERIF)
+                    .text_size(px(24.))
+                    .text_color(rgb(t.ink))
+                    .child("No meetings yet"),
+            )
+            .child(
+                div()
+                    .max_w(px(420.))
+                    .text_size(px(14.))
+                    .line_height(px(22.))
+                    .text_color(rgb(t.soft))
+                    .child("Press Record, then play a video or join a call. The words appear here and stay on this Mac."),
+            )
+            .into_any_element()
+    }
 
+    fn meeting_body(&self, m: &Meeting, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mut transcript = div()
             .id("transcript")
             .track_scroll(&self.scroll)
@@ -297,8 +376,8 @@ impl Notary {
             .flex_col()
             .px(px(24.))
             .py(px(8.));
-        for line in &m.lines {
-            let (who_color, note) = match line.who {
+        for l in &m.lines {
+            let (who_color, note) = match l.who {
                 Speaker::Me => (t.accent, false),
                 Speaker::Other => (t.ink, false),
                 Speaker::Note => (t.soft, true),
@@ -318,7 +397,7 @@ impl Notary {
                         .px(px(12.))
                         .py(px(6.))
                 })
-                .child(line.text.clone());
+                .child(l.text.clone());
             transcript = transcript.child(
                 div()
                     .flex()
@@ -334,7 +413,7 @@ impl Notary {
                             .font_family(MONO)
                             .text_size(px(11.))
                             .text_color(rgb(t.faint))
-                            .child(line.ts.clone()),
+                            .child(l.ts.clone()),
                     )
                     .child(
                         div()
@@ -348,28 +427,25 @@ impl Notary {
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(who_color))
-                                    .child(line.name.clone()),
+                                    .child(l.name.clone()),
                             )
                             .child(text),
                     ),
             );
         }
         if m.lines.is_empty() {
+            let hint = if m.live {
+                "Nothing yet. Play a video or join a call and the words appear here."
+            } else {
+                "No speech was heard in this recording."
+            };
             transcript = transcript.child(
-                div()
-                    .py(px(24.))
-                    .text_size(px(13.5))
-                    .text_color(rgb(t.faint))
-                    .child("Nothing yet. Play a video or join a call and the words appear here."),
+                div().py(px(24.)).text_size(px(13.5)).text_color(rgb(t.faint)).child(hint),
             );
         }
 
         let heading = |s: &'static str| {
-            div()
-                .font_family(SERIF)
-                .text_size(px(14.))
-                .text_color(rgb(t.ink))
-                .child(s)
+            div().font_family(SERIF).text_size(px(14.)).text_color(rgb(t.ink)).child(s)
         };
         let mut summary = div().flex().flex_col().gap(px(10.)).child(heading("Summary"));
         if m.summary.is_empty() {
@@ -466,10 +542,11 @@ impl Notary {
             .child(summary)
             .when(!m.actions.is_empty(), |d| d.child(actions));
 
+        let confirming = self.confirm_delete == Some(m.id);
         let head = div()
             .flex()
-            .flex_col()
-            .gap(px(6.))
+            .items_start()
+            .gap(px(16.))
             .px(px(24.))
             .pt(px(18.))
             .pb(px(14.))
@@ -477,19 +554,56 @@ impl Notary {
             .border_color(rgb(t.line))
             .child(
                 div()
-                    .font_family(SERIF)
-                    .text_size(px(22.))
-                    .text_color(rgb(t.ink))
-                    .child(m.title.clone()),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .font_family(SERIF)
+                            .text_size(px(22.))
+                            .text_color(rgb(t.ink))
+                            .child(m.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family(MONO)
+                            .text_size(px(11.5))
+                            .text_color(rgb(t.faint))
+                            .child(m.meta()),
+                    ),
             )
-            .child(
-                div()
-                    .font_family(MONO)
-                    .text_size(px(11.5))
-                    .text_color(rgb(t.faint))
-                    .child(m.meta.clone()),
-            );
+            .when(!m.live, |d| {
+                d.child(
+                    div()
+                        .id("delete")
+                        .flex_none()
+                        .px(px(10.))
+                        .py(px(5.))
+                        .rounded(px(7.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .when(confirming, |b| b.bg(rgb(t.record)).text_color(rgb(0xFFFFFF)))
+                        .when(!confirming, |b| {
+                            b.bg(rgb(t.rail)).text_color(rgb(t.soft)).hover(|h| h.text_color(rgb(t.record)))
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx)))
+                        .child(if confirming { "Click again to delete" } else { "Delete" }),
+                )
+            });
 
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(head)
+            .child(div().flex_1().min_h_0().flex().child(transcript).child(side))
+            .into_any_element()
+    }
+
+    fn footbar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let recording = self.recording.is_some();
         let label = match (recording, self.stopping) {
             (true, true) => "Stopping",
@@ -517,7 +631,7 @@ impl Notary {
                     .when(!recording, |d| d.rounded_full().bg(rgb(t.record))),
             )
             .child(label);
-        let footbar = div()
+        div()
             .flex_none()
             .flex()
             .items_center()
@@ -536,31 +650,28 @@ impl Notary {
                     .text_size(px(12.5))
                     .text_color(rgb(t.faint))
                     .child(self.status.clone()),
-            );
+            )
+    }
 
+    fn view(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match self.meetings.get(self.selected) {
+            Some(m) => self.meeting_body(m, t, cx),
+            None => self.empty_body(t),
+        };
         div()
             .flex_1()
             .min_w_0()
             .h_full()
             .flex()
             .flex_col()
-            .child(head)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(transcript)
-                    .child(side),
-            )
-            .child(footbar)
+            .child(body)
+            .child(self.footbar(t, cx))
     }
 }
 
 impl Render for Notary {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::for_appearance(window.appearance());
-        let live = self.recording.is_some();
         div()
             .size_full()
             .flex()
@@ -568,7 +679,7 @@ impl Render for Notary {
             .bg(rgb(t.paper))
             .text_color(rgb(t.ink))
             .font_family(SANS)
-            .child(self.titlebar(&t, live))
+            .child(self.titlebar(&t, self.recording.is_some()))
             .child(
                 div()
                     .flex_1()
@@ -595,17 +706,7 @@ fn main() {
                 window_min_size: Some(size(px(860.), px(520.))),
                 ..Default::default()
             },
-            |_, cx| {
-                cx.new(|_| Notary {
-                    meetings: sample_meetings(),
-                    selected: 0,
-                    recording: None,
-                    stopping: false,
-                    status: "Ready".into(),
-                    scroll: ScrollHandle::new(),
-                    next_id: 100,
-                })
-            },
+            |_, cx| cx.new(|_| Notary::new()),
         )
         .unwrap();
         cx.activate(true);
