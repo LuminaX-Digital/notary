@@ -6,7 +6,7 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 
 **[Download Notary for Mac](https://github.com/LuminaX-Digital/notary/releases/latest)** (signed and notarized, Apple Silicon, macOS 14.4 or newer)
 
-> **Early development.** You can record, watch a live transcript in English and German, get a summary, search your meetings and ask questions across them. Expect rough edges; the status list below says what is still missing.
+> **Version 1.0.** Record calls and meetings, get a live transcript in English and German with speaker names, summaries with next steps, search and questions across your meetings, all on your Mac. The status list says what was tested against live calls and what only on test data.
 
 ## Status
 
@@ -29,8 +29,13 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 | Trash with 30 days to restore, ZIP backup | Works |
 | Calendar: coming up, titles and attendees from the matching event | Built; needs the Calendar permission to try |
 | Your name, spoken language, summary language, custom words, permissions | Works |
-| Playback, MCP server, menu bar, pause, audio import | Planned |
-| Windows and Linux | Not planned for v1 |
+| Playback from any line, pause and resume, find in a transcript | Works |
+| Import an audio or video file and transcribe it | Works |
+| Menu bar item to open Notary and start or stop recording | Works |
+| MCP server for AI apps (read only, off by default): `Notary mcp` | Works |
+| Regenerate a summary with your own instruction | Works |
+| First-run setup with permissions | Works |
+| Windows and Linux | Not planned |
 
 ## Requirements
 

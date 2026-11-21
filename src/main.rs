@@ -158,6 +158,7 @@ struct Notary {
     play_gen: u64,
     paused_at: Option<std::time::Instant>,
     importing: bool,
+    menu_bar: Option<watch::MenuBar>,
 }
 
 fn clock(secs: f32) -> String {
@@ -184,12 +185,15 @@ impl Notary {
         let trash = store.as_ref().and_then(|s| s.load_trash().ok()).unwrap_or_default();
         let folders = store.as_ref().and_then(|s| s.load_folders().ok()).unwrap_or_default();
         let settings = Settings::load();
+        let onboarded = settings.onboarded;
         let mut name_input = TextInput::default();
         name_input.set(&settings.your_name);
         let mut words_input = TextInput::default();
         words_input.set(&settings.custom_words);
         Self::watch_microphone(cx);
         Self::watch_calendar(cx);
+        Self::start_menu_bar(cx);
+        Self::load_permissions(cx);
         Self {
             settings,
             name_input,
@@ -217,7 +221,7 @@ impl Notary {
             qa: Vec::new(),
             asking: false,
             ask_scroll: ScrollHandle::new(),
-            setup_open: models::find(Kind::Speech).is_none(),
+            setup_open: models::find(Kind::Speech).is_none() || !onboarded,
             downloads: [Dl::Idle, Dl::Idle, Dl::Idle],
             store,
             meetings,
@@ -253,6 +257,7 @@ impl Notary {
             play_gen: 0,
             paused_at: None,
             importing: false,
+            menu_bar: None,
         }
     }
 
@@ -295,6 +300,43 @@ impl Notary {
             }
         })
         .detach();
+    }
+
+    /// A menu bar item to open Notary and start or stop recording from anywhere.
+    fn start_menu_bar(cx: &mut Context<Self>) {
+        let Some((bar, mut commands)) = watch::menu_bar() else { return };
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |this, _| this.menu_bar = Some(bar));
+            while let Some(command) = commands.next().await {
+                let alive = this.update(cx, |this, cx| match command.as_str() {
+                    "open" => cx.activate(true),
+                    "toggle" => {
+                        if this.recording.is_some() {
+                            this.toggle_recording(cx);
+                        } else {
+                            this.toggle_recording(cx);
+                            cx.activate(true);
+                        }
+                    }
+                    "quit" => cx.quit(),
+                    _ => {}
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn sync_menu_bar(&self) {
+        if let Some(bar) = &self.menu_bar {
+            bar.set_state(match (&self.recording, self.paused_at.is_some()) {
+                (None, _) => "idle",
+                (Some(_), true) => "paused",
+                (Some(_), false) => "recording",
+            });
+        }
     }
 
     /// Events to show and to match: not declined, not in a hidden calendar.
@@ -503,6 +545,7 @@ impl Notary {
             }
         })
         .detach();
+        self.sync_menu_bar();
         cx.notify();
     }
 
@@ -580,6 +623,7 @@ impl Notary {
                 }
             }
         }
+        self.sync_menu_bar();
         cx.notify();
     }
 
@@ -1003,6 +1047,19 @@ impl Notary {
         cx.notify();
     }
 
+    fn load_permissions(cx: &mut Context<Self>) {
+        let rx = native::in_background(native::status);
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(status)) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.perms = Some(status);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Reads the macOS permissions the helper needs, without asking for any.
     fn refresh_permissions(&mut self, cx: &mut Context<Self>) {
         let rx = native::in_background(native::status);
@@ -1363,6 +1420,7 @@ impl Notary {
                 self.status = "Listening".into();
             }
         }
+        self.sync_menu_bar();
         cx.notify();
     }
 
@@ -2370,6 +2428,10 @@ impl Notary {
                                 .text_color(rgb(t.raised))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.setup_open = false;
+                                    if !this.settings.onboarded {
+                                        this.settings.onboarded = true;
+                                        this.persist_settings();
+                                    }
                                     cx.notify();
                                 }))
                         })
@@ -2757,7 +2819,7 @@ impl Notary {
                         .overflow_hidden()
                         .child(field_text(&self.find_input, "Find in this transcript", 40, 13., find_focused, t)),
                 )
-                .child(div().flex_none().text_size(px(12.)).text_color(rgb(t.faint)).child(format!("{found} found")))
+                .when(!find_terms.is_empty(), |d| d.child(div().flex_none().text_size(px(12.)).text_color(rgb(t.faint)).child(format!("{found} found"))))
             });
         let confirming = self.confirm_delete == Some(m.id);
         let head = div()

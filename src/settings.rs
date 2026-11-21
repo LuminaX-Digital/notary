@@ -23,6 +23,8 @@ pub struct Settings {
     pub stop_when_call_ends: bool,
     pub offer_to_record: bool,
     pub mcp_enabled: bool,
+    /// The first-run setup was finished once.
+    pub onboarded: bool,
     pub hide_events_without_link: bool,
     pub hidden_calendars: Vec<String>,
 }
@@ -42,6 +44,7 @@ impl Default for Settings {
             stop_when_call_ends: true,
             offer_to_record: true,
             mcp_enabled: false,
+            onboarded: false,
             hide_events_without_link: false,
             hidden_calendars: Vec::new(),
         }

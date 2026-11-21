@@ -464,6 +464,68 @@ func callTitles(_ bundles: [String]) {
     emit(out)
 }
 
+// MARK: - menubar
+
+final class MenuBar: NSObject {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let toggleItem = NSMenuItem(title: "Start recording", action: #selector(toggle), keyEquivalent: "")
+
+    override init() {
+        super.init()
+        let menu = NSMenu()
+        let open = NSMenuItem(title: "Open Notary", action: #selector(openApp), keyEquivalent: "")
+        open.target = self
+        toggleItem.target = self
+        let quit = NSMenuItem(title: "Quit Notary", action: #selector(quitApp), keyEquivalent: "")
+        quit.target = self
+        menu.addItem(open)
+        menu.addItem(toggleItem)
+        menu.addItem(.separator())
+        menu.addItem(quit)
+        item.menu = menu
+        show(state: "idle")
+    }
+
+    func send(_ word: String) {
+        FileHandle.standardOutput.write((word + "\n").data(using: .utf8)!)
+    }
+
+    @objc func openApp() { send("open") }
+    @objc func toggle() { send("toggle") }
+    @objc func quitApp() { send("quit") }
+
+    func show(state: String) {
+        let recording = state == "recording" || state == "paused"
+        let image = NSImage(systemSymbolName: recording ? "record.circle.fill" : "waveform", accessibilityDescription: "Notary")
+        image?.isTemplate = !recording
+        item.button?.image = image
+        item.button?.contentTintColor = recording ? (state == "paused" ? .systemOrange : .systemRed) : nil
+        toggleItem.title = recording ? "Stop recording" : "Start recording"
+    }
+}
+
+/// Shows a menu bar item. Prints "open", "toggle" or "quit" when chosen; reads "idle", "recording" or "paused" on stdin.
+func menuBar() {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let bar = MenuBar()
+    signal(SIGPIPE, SIG_IGN)
+    Thread.detachNewThread {
+        var pending = Data()
+        while true {
+            let chunk = FileHandle.standardInput.availableData
+            if chunk.isEmpty { exit(0) }
+            pending.append(chunk)
+            while let nl = pending.firstIndex(of: 10) {
+                let line = String(data: pending[pending.startIndex..<nl], encoding: .utf8) ?? ""
+                pending.removeSubrange(pending.startIndex...nl)
+                DispatchQueue.main.async { bar.show(state: line.trimmingCharacters(in: .whitespaces)) }
+            }
+        }
+    }
+    app.run()
+}
+
 // MARK: - play
 
 /// Plays audio files together from `start` seconds; ends when they finish or when stdin closes.
@@ -526,6 +588,7 @@ case "mic-apps": listMicApps()
 case "running-apps": listRunningApps()
 case "call-watch": callWatch(rest)
 case "call-titles": callTitles(rest)
+case "menubar": menuBar()
 case "play": play(rest)
 case "ax-dump": axDump(rest)
 default: fail("unknown-command", exitCode: 2)

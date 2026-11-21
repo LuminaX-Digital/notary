@@ -163,3 +163,50 @@ pub fn play(start: f32, files: &[std::path::PathBuf]) -> Option<(Player, futures
     });
     Some((Player { child }, rx))
 }
+
+/// The menu bar item, run by the helper. Dropping it removes the item.
+pub struct MenuBar {
+    child: Arc<std::sync::Mutex<Option<Child>>>,
+    stdin: std::sync::Mutex<Option<std::process::ChildStdin>>,
+}
+
+impl MenuBar {
+    /// Shows "idle", "recording" or "paused".
+    pub fn set_state(&self, state: &str) {
+        use std::io::Write;
+        if let Ok(mut guard) = self.stdin.lock() {
+            if let Some(stdin) = guard.as_mut() {
+                let _ = writeln!(stdin, "{state}");
+            }
+        }
+    }
+}
+
+impl Drop for MenuBar {
+    fn drop(&mut self) {
+        if let Ok(mut c) = self.child.lock() {
+            if let Some(mut child) = c.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+/// Starts the menu bar item. The receiver gets "open", "toggle" or "quit".
+pub fn menu_bar() -> Option<(MenuBar, UnboundedReceiver<String>)> {
+    let helper = native::helper_path()?;
+    let mut child = Command::new(helper).arg("menubar").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let stdin = child.stdin.take();
+    let (tx, rx) = unbounded();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.unbounded_send(line).is_err() {
+                break;
+            }
+        }
+    });
+    Some((MenuBar { child: Arc::new(std::sync::Mutex::new(Some(child))), stdin: std::sync::Mutex::new(stdin) }, rx))
+}

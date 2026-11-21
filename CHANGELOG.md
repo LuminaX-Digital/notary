@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.0
+
+- Playback: play a meeting's audio from the start or from any line by clicking its time.
+- Pause and resume a recording; nothing is kept while paused.
+- Import an audio or video file and Notary transcribes it into a new meeting.
+- Find a word in a transcript.
+- Regenerate a summary with your own instruction, for example what to focus on.
+- A menu bar item to open Notary and start or stop recording from anywhere.
+- MCP server for AI apps such as Claude or Cursor. Read only, off by default, turned on in Settings. Add the command shown there to your AI app.
+- First-run setup shows the permissions Notary uses before you start.
+
 ## 0.3.0
 
 - Speaker names: while you record a Zoom, Teams or Google Meet call, Notary reads who is speaking from the call window (needs the Accessibility permission) and puts the name on each line. The meeting shows who was in the call. Windows can change between app versions; if no name is found a line stays "Call audio".
