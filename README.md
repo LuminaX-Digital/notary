@@ -4,6 +4,8 @@ Private meeting notes for Mac. Notary listens to the sound your Mac plays, write
 
 Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates/gpui), the renderer behind the Zed editor, so it starts fast and uses no web view.
 
+**[Download Notary for Mac](https://github.com/LuminaX-Digital/notary/releases/latest)** (signed and notarized, Apple Silicon, macOS 14.4 or newer)
+
 > **Early development.** You can record, watch a live transcript in English and German, and come back to your saved meetings later. Search and "ask across meetings" are not built yet. See the status list below.
 
 ## Status
