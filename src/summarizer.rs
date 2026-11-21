@@ -6,8 +6,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-const MODEL_FILE: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
-
 pub struct Notes {
     pub title: Option<String>,
     pub sections: Vec<(String, String)>,
@@ -15,15 +13,7 @@ pub struct Notes {
 }
 
 pub fn model_path() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(p) = std::env::var("NOTARY_LLM") {
-        candidates.push(PathBuf::from(p));
-    }
-    candidates.push(PathBuf::from("models").join(MODEL_FILE));
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join("Library/Application Support/Notary/models").join(MODEL_FILE));
-    }
-    candidates.into_iter().find(|p| p.exists())
+    crate::models::find(crate::models::Kind::Summary)
 }
 
 fn helper_path() -> Result<PathBuf> {

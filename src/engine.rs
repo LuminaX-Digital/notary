@@ -46,16 +46,7 @@ impl Recording {
 }
 
 pub fn model_path() -> Option<PathBuf> {
-    const FILE: &str = "ggml-large-v3-turbo-q5_0.bin";
-    let mut candidates = Vec::new();
-    if let Ok(p) = std::env::var("NOTARY_MODEL") {
-        candidates.push(PathBuf::from(p));
-    }
-    candidates.push(PathBuf::from("models").join(FILE));
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join("Library/Application Support/Notary/models").join(FILE));
-    }
-    candidates.into_iter().find(|p| p.exists())
+    crate::models::find(crate::models::Kind::Speech)
 }
 
 pub fn start(model: PathBuf) -> (Recording, UnboundedReceiver<Event>) {

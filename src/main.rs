@@ -1,15 +1,17 @@
 mod data;
 mod engine;
+mod models;
 mod store;
 mod summarizer;
 mod theme;
 
 use data::{Action, Meeting, Speaker, line};
 use engine::{Event, Recording, Source};
+use models::{Download, Kind, Progress};
 use futures::StreamExt;
 use gpui::{
     AnyElement, App, Application, Bounds, Context, FontWeight, IntoElement, Render, ScrollHandle,
-    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px,
+    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, relative,
     rgb, size,
 };
 use store::Store;
@@ -20,8 +22,17 @@ const SERIF: &str = "Iowan Old Style";
 const MONO: &str = "Menlo";
 const DEFAULT_TITLE: &str = "New note";
 const MIN_WORDS_TO_SUMMARIZE: usize = 25;
+const STALL_HINT_SECS: u64 = 8;
+
+enum Dl {
+    Idle,
+    Active { done: u64, total: u64, verifying: bool, started: std::time::Instant, handle: Download },
+    Failed(String),
+}
 
 struct Notary {
+    setup_open: bool,
+    downloads: [Dl; 2],
     store: Option<Store>,
     meetings: Vec<Meeting>,
     selected: usize,
@@ -48,6 +59,8 @@ impl Notary {
             }
         };
         Self {
+            setup_open: models::find(Kind::Speech).is_none(),
+            downloads: [Dl::Idle, Dl::Idle],
             store,
             meetings,
             selected: 0,
@@ -76,7 +89,8 @@ impl Notary {
             return;
         }
         let Some(model) = engine::model_path() else {
-            self.status = "Model not found. Put ggml-large-v3-turbo-q5_0.bin in ./models or set NOTARY_MODEL.".into();
+            self.setup_open = true;
+            self.status = "Download the speech model to start recording".into();
             cx.notify();
             return;
         };
@@ -166,6 +180,66 @@ impl Notary {
         cx.notify();
     }
 
+    fn start_download(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        if matches!(self.downloads[kind as usize], Dl::Active { .. }) {
+            return;
+        }
+        let (handle, mut progress) = models::start(kind);
+        self.downloads[kind as usize] = Dl::Active {
+            done: 0,
+            total: models::spec(kind).size,
+            verifying: false,
+            started: std::time::Instant::now(),
+            handle,
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(STALL_HINT_SECS)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            while let Some(p) = progress.next().await {
+                let finished = matches!(p, Progress::Done | Progress::Failed(_) | Progress::Cancelled);
+                if this.update(cx, |this, cx| this.apply_progress(kind, p, cx)).is_err() || finished {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn cancel_download(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        if let Dl::Active { handle, .. } = &self.downloads[kind as usize] {
+            handle.cancel();
+            cx.notify();
+        }
+    }
+
+    fn apply_progress(&mut self, kind: Kind, progress: Progress, cx: &mut Context<Self>) {
+        let slot = &mut self.downloads[kind as usize];
+        match progress {
+            Progress::Bytes { done: d, total: t } => {
+                if let Dl::Active { done, total, .. } = slot {
+                    *done = d;
+                    *total = t;
+                }
+            }
+            Progress::Verifying => {
+                if let Dl::Active { verifying, .. } = slot {
+                    *verifying = true;
+                }
+            }
+            Progress::Done => {
+                *slot = Dl::Idle;
+                self.status = format!("{} model installed", models::spec(kind).name).into();
+            }
+            Progress::Failed(message) => *slot = Dl::Failed(message),
+            Progress::Cancelled => *slot = Dl::Idle,
+        }
+        cx.notify();
+    }
+
     fn start_summary(&mut self, id: i64, cx: &mut Context<Self>) {
         let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) else { return };
         if m.summarizing || m.live {
@@ -177,7 +251,8 @@ impl Notary {
             return;
         }
         let Some(model) = summarizer::model_path() else {
-            self.status = "Summary model not found. Put Qwen3-4B-Instruct-2507-Q4_K_M.gguf in ./models or set NOTARY_LLM.".into();
+            self.setup_open = true;
+            self.status = "Download the summary model to write summaries".into();
             cx.notify();
             return;
         };
@@ -312,7 +387,7 @@ impl Notary {
             )
     }
 
-    fn rail(&self, t: &Theme) -> impl IntoElement {
+    fn rail(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let glyph = |s: &'static str, active: bool| {
             div()
                 .size(px(36.))
@@ -338,11 +413,27 @@ impl Notary {
             .bg(rgb(t.rail))
             .border_r_1()
             .border_color(rgb(t.line))
-            .child(glyph("\u{25a4}", true))
+            .child(
+                glyph("\u{25a4}", !self.setup_open)
+                    .id("nav-meetings")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.setup_open = false;
+                        cx.notify();
+                    })),
+            )
             .child(glyph("\u{2315}", false))
             .child(glyph("\u{25a2}", false))
             .child(div().flex_1())
-            .child(glyph("\u{2699}", false))
+            .child(
+                glyph("\u{2699}", self.setup_open)
+                    .id("nav-setup")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.setup_open = true;
+                        cx.notify();
+                    })),
+            )
     }
 
     fn list(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -439,6 +530,196 @@ impl Notary {
                     ),
             )
             .child(items)
+    }
+
+    fn model_row(&self, kind: Kind, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let spec = models::spec(kind);
+        let installed = models::find(kind).is_some();
+        let state = &self.downloads[kind as usize];
+        let active = matches!(state, Dl::Active { .. });
+
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_none()
+                .px(px(14.))
+                .py(px(6.))
+                .rounded(px(8.))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(primary, |d| d.bg(rgb(t.accent)).text_color(rgb(t.raised)))
+                .when(!primary, |d| d.bg(rgb(t.rail)).text_color(rgb(t.soft)))
+                .child(label)
+        };
+
+        let action: AnyElement = if installed {
+            div().text_size(px(12.5)).text_color(rgb(t.accent)).child("Installed").into_any_element()
+        } else if active {
+            button(if kind == Kind::Speech { "cancel-speech" } else { "cancel-summary" }, "Cancel", false)
+                .on_click(cx.listener(move |this, _, _, cx| this.cancel_download(kind, cx)))
+                .into_any_element()
+        } else {
+            let label = if matches!(state, Dl::Failed(_)) { "Retry" } else { "Download" };
+            button(if kind == Kind::Speech { "get-speech" } else { "get-summary" }, label, true)
+                .on_click(cx.listener(move |this, _, _, cx| this.start_download(kind, cx)))
+                .into_any_element()
+        };
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .p(px(16.))
+            .rounded(px(12.))
+            .bg(rgb(t.raised))
+            .border_1()
+            .border_color(rgb(t.line))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(16.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_baseline()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .font_family(SERIF)
+                                            .text_size(px(16.))
+                                            .text_color(rgb(t.ink))
+                                            .child(spec.name),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(MONO)
+                                            .text_size(px(11.))
+                                            .text_color(rgb(t.faint))
+                                            .child(models::format_bytes(spec.size)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .line_height(px(19.))
+                                    .text_color(rgb(t.soft))
+                                    .child(spec.blurb),
+                            ),
+                    )
+                    .child(action),
+            );
+
+        if let Dl::Active { done, total, verifying, started, .. } = state {
+            let fraction = if *verifying { 1.0 } else { (*done as f32 / *total as f32).clamp(0.0, 1.0) };
+            let text = if *verifying {
+                "Checking the download".to_string()
+            } else {
+                format!("{} of {}", models::format_bytes(*done), models::format_bytes(*total))
+            };
+            card = card
+                .child(
+                    div()
+                        .h(px(6.))
+                        .w_full()
+                        .rounded_full()
+                        .bg(rgb(t.rail))
+                        .child(div().h_full().w(relative(fraction)).rounded_full().bg(rgb(t.accent))),
+                )
+                .child(div().text_size(px(12.)).text_color(rgb(t.faint)).child(text));
+            if *done == 0 && !*verifying && started.elapsed().as_secs() >= STALL_HINT_SECS {
+                card = card.child(
+                    div()
+                        .text_size(px(12.5))
+                        .line_height(px(19.))
+                        .text_color(rgb(t.soft))
+                        .child("Waiting for a connection. If a firewall such as LuLu or Little Snitch asks, allow Notary to connect to huggingface.co."),
+                );
+            }
+        }
+        if let Dl::Failed(message) = state {
+            card = card.child(div().text_size(px(12.5)).line_height(px(19.)).text_color(rgb(t.record)).child(message.clone()));
+        }
+        card
+    }
+
+    fn setup_body(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let ready = models::find(Kind::Speech).is_some();
+        let busy = self.downloads.iter().any(|d| matches!(d, Dl::Active { .. }));
+        let mut column = div()
+            .w_full()
+            .max_w(px(600.))
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(
+                div()
+                    .font_family(SERIF)
+                    .text_size(px(26.))
+                    .text_color(rgb(t.ink))
+                    .child("Set up Notary"),
+            )
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .line_height(px(22.))
+                    .text_color(rgb(t.soft))
+                    .child("Notary works without an internet connection. These models are downloaded once from huggingface.co and stay on this Mac. Nothing is downloaded until you press Download."),
+            );
+        for kind in models::ALL {
+            column = column.child(self.model_row(kind, t, cx));
+        }
+        column = column.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .id("setup-done")
+                        .px(px(16.))
+                        .py(px(8.))
+                        .rounded(px(9.))
+                        .when(ready && !busy, |d| {
+                            d.cursor_pointer()
+                                .bg(rgb(t.accent))
+                                .text_color(rgb(t.raised))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.setup_open = false;
+                                    cx.notify();
+                                }))
+                        })
+                        .when(!(ready && !busy), |d| d.bg(rgb(t.rail)).text_color(rgb(t.faint)))
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Start using Notary"),
+                )
+                .child(div().text_size(px(12.5)).text_color(rgb(t.faint)).child(if ready {
+                    "The speech model is installed."
+                } else {
+                    "Download the speech model to begin."
+                })),
+        );
+        div()
+            .id("setup")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .items_center()
+            .px(px(40.))
+            .py(px(48.))
+            .child(column)
+            .into_any_element()
     }
 
     fn empty_body(&self, t: &Theme) -> AnyElement {
@@ -791,9 +1072,13 @@ impl Notary {
     }
 
     fn view(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = match self.meetings.get(self.selected) {
-            Some(m) => self.meeting_body(m, t, cx),
-            None => self.empty_body(t),
+        let body = if self.setup_open {
+            self.setup_body(t, cx)
+        } else {
+            match self.meetings.get(self.selected) {
+                Some(m) => self.meeting_body(m, t, cx),
+                None => self.empty_body(t),
+            }
         };
         div()
             .flex_1()
@@ -822,7 +1107,7 @@ impl Render for Notary {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(self.rail(&t))
+                    .child(self.rail(&t, cx))
                     .child(self.list(&t, cx))
                     .child(self.view(&t, cx)),
             )

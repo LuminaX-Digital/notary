@@ -12,7 +12,8 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 |---|---|
 | Live transcript from system audio | Works |
 | English and German, language detected per phrase | Works |
-| Local model, no network use while recording | Works |
+| Local models, no network use while recording | Works |
+| Models download inside the app, with resume and a checksum check | Works |
 | Meetings saved on this Mac, with delete | Works |
 | Microphone (your own voice, macOS 15 or newer) | Built, needs more testing |
 | Summaries, titles and next steps you can tick off, in English or German | Works |
@@ -31,16 +32,14 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 ```bash
 git clone <this repository>
 cd notary
-mkdir -p models
-curl -L -o models/ggml-large-v3-turbo-q5_0.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
-curl -L -o models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
-  https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
-cargo build --release
 cargo run --release
 ```
 
-The speech model is about 550 MB and the summary model about 2.5 GB. Notary looks for them in `./models`, in `~/Library/Application Support/Notary/models`, or at the paths in `NOTARY_MODEL` and `NOTARY_LLM`. Summaries run in a separate helper program (`notary-llm`) that starts only while a summary is written.
+On first launch Notary shows a setup screen. It downloads two models from huggingface.co only when you press Download: speech recognition (574 MB, required) and summaries (2.5 GB, optional). Downloads can be cancelled and resumed, and each file is checked against its official SHA-256 before it is used.
+
+Models are stored in `~/Library/Application Support/Notary/models`. To use another folder, or to install models by hand on an offline Mac, set `NOTARY_MODELS_DIR`, or point `NOTARY_MODEL` and `NOTARY_LLM` at the files. Summaries run in a separate helper program (`notary-llm`) that starts only while a summary is written.
+
+If you use an outbound firewall such as LuLu or Little Snitch, allow Notary to connect to huggingface.co when it asks, or the download waits.
 
 On first use macOS asks for Screen Recording permission, and for microphone access on macOS 15 or newer. Notary uses them only to hear the audio your Mac plays and your own voice; it never captures the screen. Use headphones on calls so your microphone does not pick up the other side.
 
@@ -54,7 +53,7 @@ This builds `dist/Notary.app` and `dist/Notary.dmg`, ad-hoc signed so it runs on
 
 ## Privacy
 
-Audio, transcripts and the model all stay on your computer. Notary goes online only to download a model you ask for.
+Audio, transcripts and the model all stay on your computer. Notary goes online only to download a model when you press Download.
 
 ## Licence
 

@@ -14,4 +14,6 @@ gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 llama-cpp-2 = { version = "0.1.161", default-features = false, features = ["metal"] }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 screencapturekit = { version = "11.1.2", features = ["macos_13_0", "macos_15_0"] }
+sha2 = "0.11.1"
+ureq = "3.5.2"
 whisper-rs = { version = "0.16.0", features = ["metal"] }
