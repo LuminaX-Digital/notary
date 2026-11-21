@@ -36,7 +36,7 @@ pub fn search(meeting: &Meeting, terms: &[String]) -> Option<Hit> {
         lines
             .iter()
             .position(|l| l.contains(term))
-            .map(|i| around(&meeting.lines[i].text, term, 90))
+            .map(|i| around(&meeting.lines[i].text, term, 40))
     });
     Some(Hit { snippet })
 }

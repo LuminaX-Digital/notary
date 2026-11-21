@@ -4,11 +4,12 @@
 //! must not live in one executable. Usage: `notary-llm <model.gguf>`, transcript on stdin, notes on stdout.
 
 use anyhow::{Context, Result, bail};
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::params::kv_overrides::ParamOverrideValue;
 use llama_cpp_2::sampling::LlamaSampler;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
@@ -51,6 +52,53 @@ const ASK_SYSTEM_EN: &str = "You answer questions about the user's own meetings.
 
 const ASK_SYSTEM_DE: &str = "Du beantwortest Fragen zu den eigenen Besprechungen des Nutzers. Nutze nur die nummerierten Quellen. Nenne nach jeder Aussage die Quelle, zum Beispiel [1] oder [2]. Wenn die Quellen die Antwort nicht enthalten, sage das in einem Satz und rate nicht. Antworte in h\u{f6}chstens 4 kurzen S\u{e4}tzen auf Deutsch.";
 
+/// Turns each line of stdin into a vector that captures its meaning, one line of numbers per input line.
+fn embed(model_path: &str) -> Result<()> {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let texts: Vec<&str> = input.lines().collect();
+    if texts.is_empty() {
+        bail!("nothing to embed");
+    }
+    let mut backend = LlamaBackend::init()?;
+    if std::env::var("NOTARY_LLM_LOGS").is_err() {
+        backend.void_logs();
+    }
+    // The published file lacks this value, which newer llama.cpp requires for BERT models.
+    let mut params = std::pin::pin!(LlamaModelParams::default().with_n_gpu_layers(999));
+    params.as_mut().append_kv_override(c"tokenizer.ggml.token_type_count", ParamOverrideValue::Int(2));
+    let model = LlamaModel::load_from_file(&backend, model_path, &params).context("could not load the embedding model")?;
+    let vocab = model.vocab();
+    let mut ctx = model
+        .new_context(
+            &backend,
+            LlamaContextParams::default()
+                .with_embeddings(true)
+                .with_pooling_type(LlamaPoolingType::Mean)
+                .with_n_ctx(NonZeroU32::new(512))
+                .with_n_batch(512)
+                .with_n_ubatch(512),
+        )
+        .context("could not create the embedding context")?;
+    let mut batch = LlamaBatch::new(512, 1);
+    let mut out = String::new();
+    for text in texts {
+        let mut tokens = vocab.tokenize(text.as_bytes(), true, false);
+        tokens.truncate(512);
+        batch.clear();
+        batch.add_sequence(&tokens, 0, false)?;
+        ctx.clear_kv_cache();
+        ctx.decode(&mut batch)?;
+        let v = ctx.embeddings_seq_ith(0)?;
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        let line: Vec<String> = v.iter().map(|x| format!("{:.5}", x / norm)).collect();
+        out.push_str(&line.join(" "));
+        out.push('\n');
+    }
+    std::io::stdout().write_all(out.as_bytes())?;
+    Ok(())
+}
+
 fn shorten(transcript: &str) -> String {
     if transcript.len() <= MAX_TRANSCRIPT_CHARS {
         return transcript.to_string();
@@ -69,7 +117,11 @@ fn shorten(transcript: &str) -> String {
 fn main() -> Result<()> {
     let model_path = std::env::args().nth(1).context("usage: notary-llm <model.gguf> [language]")?;
     let language = std::env::args().nth(2).unwrap_or_else(|| "the language of the transcript".into());
-    let ask = std::env::args().nth(3).as_deref() == Some("ask");
+    let mode = std::env::args().nth(3).unwrap_or_default();
+    if mode == "embed" {
+        return embed(&model_path);
+    }
+    let ask = mode == "ask";
     let max_new = if ask { MAX_NEW_TOKENS_ASK } else { MAX_NEW_TOKENS };
     let mut transcript = String::new();
     std::io::stdin().read_to_string(&mut transcript)?;
@@ -95,7 +147,9 @@ fn main() -> Result<()> {
     };
 
     let mut backend = LlamaBackend::init()?;
-    backend.void_logs();
+    if std::env::var("NOTARY_LLM_LOGS").is_err() {
+        backend.void_logs();
+    }
     let model = LlamaModel::load_from_file(&backend, &model_path, &LlamaModelParams::default().with_n_gpu_layers(999))
         .context("could not load the language model")?;
     let vocab = model.vocab();

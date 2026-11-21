@@ -1,18 +1,22 @@
 mod data;
 mod ask;
 mod engine;
+mod input;
 mod models;
 mod search;
+mod semantic;
 mod store;
 mod summarizer;
 mod theme;
+mod updates;
 
 use data::{Action, Meeting, Speaker, line};
 use engine::{Event, Recording, Source};
+use input::{Outcome, TextInput};
 use models::{Download, Kind, Progress};
 use futures::StreamExt;
 use gpui::{
-    AnyElement, App, Application, Bounds, FocusHandle, KeyDownEvent, Context, FontWeight, IntoElement, Render, ScrollHandle,
+    AnyElement, App, Application, Bounds, ClipboardItem, FocusHandle, KeyDownEvent, Context, FontWeight, IntoElement, Render, ScrollHandle,
     SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, relative,
     rgb, size,
 };
@@ -25,6 +29,14 @@ const MONO: &str = "Menlo";
 const DEFAULT_TITLE: &str = "New note";
 const MIN_WORDS_TO_SUMMARIZE: usize = 25;
 const STALL_HINT_SECS: u64 = 8;
+
+enum UpdateState {
+    Idle,
+    Checking,
+    Current,
+    Available { version: SharedString, url: SharedString },
+    Failed(SharedString),
+}
 
 enum Dl {
     Idle,
@@ -43,69 +55,47 @@ enum QaState {
     Failed(SharedString),
 }
 
-enum Edit {
-    Nothing,
-    Changed,
-    Submit,
-    Escape,
-}
-
-/// Applies one key press to a one-line text: typing, backspace (Option: a word, Command: all), paste.
-fn edit_text(buf: &mut String, ev: &KeyDownEvent, cx: &App) -> Edit {
-    let k = &ev.keystroke;
-    let m = k.modifiers;
-    match k.key.as_str() {
-        "enter" => return Edit::Submit,
-        "escape" => return Edit::Escape,
-        "backspace" => {
-            if m.platform {
-                buf.clear();
-            } else if m.alt {
-                while buf.ends_with(char::is_whitespace) {
-                    buf.pop();
-                }
-                while !buf.is_empty() && !buf.ends_with(char::is_whitespace) {
-                    buf.pop();
-                }
-            } else {
-                buf.pop();
-            }
-            return Edit::Changed;
-        }
-        "v" if m.platform => {
-            return match cx.read_from_clipboard().and_then(|c| c.text()) {
-                Some(text) => {
-                    buf.push_str(&text.replace(['\n', '\r'], " "));
-                    Edit::Changed
-                }
-                None => Edit::Nothing,
-            };
-        }
-        _ => {}
+/// Draws a text field's content with its cursor and selection.
+fn field_text(input: &TextInput, placeholder: &'static str, max_chars: usize, size: f32, focused: bool, t: &Theme) -> AnyElement {
+    let caret = || div().flex_none().w(px(1.5)).h(px(size + 3.)).bg(rgb(t.accent));
+    if input.is_empty() {
+        return div()
+            .flex()
+            .items_center()
+            .text_size(px(size))
+            .text_color(rgb(t.faint))
+            .when(focused, |d| d.child(caret()))
+            .when(!focused, |d| d.child(placeholder))
+            .into_any_element();
     }
-    if m.control || m.platform {
-        return Edit::Nothing;
-    }
-    match &k.key_char {
-        Some(c) if !c.chars().any(char::is_control) => {
-            buf.push_str(c);
-            Edit::Changed
-        }
-        _ => Edit::Nothing,
-    }
+    let p = input.parts(max_chars);
+    let has_selection = !p.selected.is_empty();
+    div()
+        .flex()
+        .items_center()
+        .whitespace_nowrap()
+        .text_size(px(size))
+        .text_color(rgb(t.ink))
+        .child(p.before)
+        .when(focused && p.caret_first, |d| d.child(caret()))
+        .when(has_selection, |d| d.child(div().bg(rgb(t.accent_soft)).child(p.selected)))
+        .when(focused && !p.caret_first, |d| d.child(caret()))
+        .child(p.after)
+        .into_any_element()
 }
 
 struct Notary {
+    update_state: UpdateState,
     ask_open: bool,
-    search: String,
+    search: TextInput,
     focus_search: FocusHandle,
-    ask_input: String,
+    ask_input: TextInput,
     focus_ask: FocusHandle,
     qa: Vec<Qa>,
     asking: bool,
     ask_scroll: ScrollHandle,
     setup_open: bool,
-    downloads: [Dl; 2],
+    downloads: [Dl; 3],
     store: Option<Store>,
     meetings: Vec<Meeting>,
     selected: usize,
@@ -132,16 +122,17 @@ impl Notary {
             }
         };
         Self {
+            update_state: UpdateState::Idle,
             ask_open: false,
-            search: String::new(),
+            search: TextInput::default(),
             focus_search: cx.focus_handle(),
-            ask_input: String::new(),
+            ask_input: TextInput::default(),
             focus_ask: cx.focus_handle(),
             qa: Vec::new(),
             asking: false,
             ask_scroll: ScrollHandle::new(),
             setup_open: models::find(Kind::Speech).is_none(),
-            downloads: [Dl::Idle, Dl::Idle],
+            downloads: [Dl::Idle, Dl::Idle, Dl::Idle],
             store,
             meetings,
             selected: 0,
@@ -258,6 +249,28 @@ impl Notary {
                 }
             }
         }
+        cx.notify();
+    }
+
+    fn check_updates(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.update_state, UpdateState::Checking) {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        let rx = updates::check();
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                this.update_state = match result {
+                    Ok(Ok(Some(r))) => UpdateState::Available { version: r.version.into(), url: r.url.into() },
+                    Ok(Ok(None)) => UpdateState::Current,
+                    Ok(Err(e)) => UpdateState::Failed(format!("{e:#}").into()),
+                    Err(_) => UpdateState::Failed("The check was interrupted".into()),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -531,7 +544,6 @@ impl Notary {
     fn search_field(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_search.is_focused(window);
         let empty = self.search.is_empty();
-        let shown: SharedString = if empty { "Search meetings".into() } else { self.search.clone().into() };
         div()
             .id("search")
             .track_focus(&self.focus_search)
@@ -554,16 +566,8 @@ impl Notary {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(13.))
-                            .text_color(rgb(if empty { t.faint } else { t.ink }))
-                            .when(!(empty && focused), |d| d.child(shown)),
-                    )
-                    .when(focused, |d| d.child(div().w(px(1.5)).h(px(15.)).bg(rgb(t.accent)))),
+                    .overflow_hidden()
+                    .child(field_text(&self.search, "Search meetings", 24, 13., focused, t)),
             )
             .when(!empty, |d| {
                 d.child(
@@ -581,21 +585,32 @@ impl Notary {
             })
     }
 
+    fn key_into(input: &mut TextInput, ev: &KeyDownEvent, cx: &mut Context<Self>) -> Outcome {
+        let Some(action) = input::action_for(ev, || cx.read_from_clipboard().and_then(|c| c.text())) else {
+            return Outcome::Nothing;
+        };
+        let outcome = input.apply(action);
+        if let Outcome::Copied(text) = &outcome {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        }
+        outcome
+    }
+
     fn on_search_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
-        match edit_text(&mut self.search, ev, cx) {
-            Edit::Escape => self.search.clear(),
-            Edit::Nothing => return,
+        match Self::key_into(&mut self.search, ev, cx) {
+            Outcome::Nothing => return,
+            Outcome::Escape => self.search.clear(),
             _ => {}
         }
         cx.notify();
     }
 
     fn on_ask_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
-        match edit_text(&mut self.ask_input, ev, cx) {
-            Edit::Submit => return self.submit_question(cx),
-            Edit::Escape => self.ask_input.clear(),
-            Edit::Nothing => return,
-            Edit::Changed => {}
+        match Self::key_into(&mut self.ask_input, ev, cx) {
+            Outcome::Nothing => return,
+            Outcome::Submit => return self.submit_question(cx),
+            Outcome::Escape => self.ask_input.clear(),
+            _ => {}
         }
         cx.notify();
     }
@@ -611,7 +626,7 @@ impl Notary {
     }
 
     fn submit_question(&mut self, cx: &mut Context<Self>) {
-        let question = self.ask_input.trim().to_string();
+        let question = self.ask_input.text().trim().to_string();
         if question.is_empty() || self.asking {
             return;
         }
@@ -623,21 +638,76 @@ impl Notary {
             return;
         };
         self.ask_input.clear();
-        let sources = ask::retrieve(&self.meetings, &question, 6);
         let slot = self.qa.len();
+        self.qa.push(Qa { question: question.clone().into(), answer: QaState::Pending });
+        self.asking = true;
+        self.ask_scroll.scroll_to_bottom();
+
+        let existing = self.store.as_ref().and_then(|s| s.load_vectors().ok()).unwrap_or_default();
+        let stale: Vec<ask::IndexChunk> = ask::index_chunks(&self.meetings)
+            .into_iter()
+            .filter(|c| existing.get(&c.key).map(|(h, _)| h.as_str()) != Some(c.hash.as_str()))
+            .collect();
+        match models::find(Kind::Embedding) {
+            Some(embedding_model) => {
+                let rx = semantic::embed(embedding_model, question.clone(), stale.iter().map(|c| c.text.clone()).collect());
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |this, cx| this.continue_ask(slot, question, model, existing, stale, Some(result), cx));
+                })
+                .detach();
+            }
+            None => self.continue_ask(slot, question, model, existing, stale, None, cx),
+        }
+        cx.notify();
+    }
+
+    /// Second step of a question: keep the new meaning vectors, pick the passages, ask the model.
+    fn continue_ask(
+        &mut self,
+        slot: usize,
+        question: String,
+        model: std::path::PathBuf,
+        mut vectors: std::collections::HashMap<String, (String, Vec<f32>)>,
+        stale: Vec<ask::IndexChunk>,
+        embedded: Option<Result<anyhow::Result<semantic::Embedded>, futures::channel::oneshot::Canceled>>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut query = None;
+        if let Some(Ok(Ok(e))) = embedded {
+            let rows: Vec<(String, i64, String, Vec<f32>)> = stale
+                .iter()
+                .zip(e.passages)
+                .map(|(c, v)| (c.key.clone(), c.meeting_id, c.hash.clone(), v))
+                .collect();
+            let saved = self.store.as_ref().map(|s| s.save_vectors(&rows));
+            if let Some(result) = saved {
+                self.save(result);
+            }
+            for (key, _, hash, vec) in rows {
+                vectors.insert(key, (hash, vec));
+            }
+            query = Some(e.query);
+        }
+        let by_meaning = query.map(|q| ask::Semantic {
+            query: q,
+            vectors: vectors.into_iter().map(|(k, (_, v))| (k, v)).collect(),
+        });
+        let sources = ask::retrieve(&self.meetings, &question, 6, by_meaning.as_ref());
         if sources.is_empty() {
             let text = if summarizer::detect_language(&question) == "German" {
                 "Dazu habe ich in deinen Meetings nichts gefunden. Versuche andere Worte oder nimm das Meeting zuerst auf."
             } else {
                 "I couldn't find anything about that in your meetings. Try other words, or record the meeting first."
             };
-            self.qa.push(Qa { question: question.into(), answer: QaState::Done { text: text.into(), sources: Vec::new() } });
+            if let Some(qa) = self.qa.get_mut(slot) {
+                qa.answer = QaState::Done { text: text.into(), sources: Vec::new() };
+            }
+            self.asking = false;
             self.ask_scroll.scroll_to_bottom();
             cx.notify();
             return;
         }
-        self.qa.push(Qa { question: question.clone().into(), answer: QaState::Pending });
-        self.asking = true;
         let refs: Vec<(i64, String)> = sources.iter().map(|s| (s.meeting_id, format!("{} \u{b7} {}", s.title, s.when))).collect();
         let rx = ask::answer(model, question, &sources);
         cx.spawn(async move |this, cx| {
@@ -645,7 +715,6 @@ impl Notary {
             let _ = this.update(cx, |this, cx| this.apply_answer(slot, refs, result, cx));
         })
         .detach();
-        self.ask_scroll.scroll_to_bottom();
         cx.notify();
     }
 
@@ -677,7 +746,7 @@ impl Notary {
     }
 
     fn list(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let terms = search::terms(&self.search);
+        let terms = search::terms(self.search.text());
         let mut items = div().id("meetings").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().px(px(6.)).pb(px(10.));
         let mut last_day = String::new();
         let mut shown = 0;
@@ -812,7 +881,7 @@ impl Notary {
                         .text_color(rgb(t.soft))
                         .hover(|h| h.text_color(rgb(t.accent)))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.ask_input = example.to_string();
+                            this.ask_input.set(example);
                             window.focus(&this.focus_ask);
                             cx.notify();
                         }))
@@ -863,7 +932,6 @@ impl Notary {
         }
 
         let empty = self.ask_input.is_empty();
-        let shown: SharedString = if empty { "Ask something about your meetings".into() } else { self.ask_input.clone().into() };
         let bar = div()
             .w_full()
             .max_w(px(660.))
@@ -890,14 +958,8 @@ impl Notary {
                     .flex()
                     .items_center()
                     .cursor_pointer()
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(14.))
-                            .text_color(rgb(if empty { t.faint } else { t.ink }))
-                            .when(!(empty && focused), |d| d.child(shown)),
-                    )
-                    .when(focused, |d| d.child(div().w(px(1.5)).h(px(16.)).bg(rgb(t.accent)))),
+                    .overflow_hidden()
+                    .child(field_text(&self.ask_input, "Ask something about your meetings", 64, 14., focused, t)),
             )
             .child(
                 div()
@@ -947,7 +1009,7 @@ impl Notary {
         let state = &self.downloads[kind as usize];
         let active = matches!(state, Dl::Active { .. });
 
-        let button = |id: &'static str, label: &'static str, primary: bool| {
+        let button = |id: SharedString, label: &'static str, primary: bool| {
             div()
                 .id(id)
                 .flex_none()
@@ -965,12 +1027,12 @@ impl Notary {
         let action: AnyElement = if installed {
             div().text_size(px(12.5)).text_color(rgb(t.accent)).child("Installed").into_any_element()
         } else if active {
-            button(if kind == Kind::Speech { "cancel-speech" } else { "cancel-summary" }, "Cancel", false)
+            button(format!("cancel-{}", spec.id).into(), "Cancel", false)
                 .on_click(cx.listener(move |this, _, _, cx| this.cancel_download(kind, cx)))
                 .into_any_element()
         } else {
             let label = if matches!(state, Dl::Failed(_)) { "Retry" } else { "Download" };
-            button(if kind == Kind::Speech { "get-speech" } else { "get-summary" }, label, true)
+            button(format!("get-{}", spec.id).into(), label, true)
                 .on_click(cx.listener(move |this, _, _, cx| this.start_download(kind, cx)))
                 .into_any_element()
         };
@@ -1086,6 +1148,76 @@ impl Notary {
         for kind in models::ALL {
             column = column.child(self.model_row(kind, t, cx));
         }
+        let (update_text, update_color): (SharedString, u32) = match &self.update_state {
+            UpdateState::Idle => ("".into(), t.faint),
+            UpdateState::Checking => ("Checking github.com".into(), t.faint),
+            UpdateState::Current => ("You have the latest version.".into(), t.soft),
+            UpdateState::Available { version, .. } => (format!("Version {version} is available.").into(), t.accent),
+            UpdateState::Failed(message) => (message.clone(), t.record),
+        };
+        let open_url: Option<SharedString> = match &self.update_state {
+            UpdateState::Available { url, .. } => Some(url.clone()),
+            _ => None,
+        };
+        let update_button = div()
+            .id("check-updates")
+            .flex_none()
+            .px(px(14.))
+            .py(px(6.))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .bg(rgb(if open_url.is_some() { t.accent } else { t.rail }))
+            .text_color(rgb(if open_url.is_some() { t.raised } else { t.soft }))
+            .text_size(px(12.5))
+            .font_weight(FontWeight::SEMIBOLD)
+            .on_click(cx.listener(move |this, _, _, cx| match &open_url {
+                Some(url) => cx.open_url(url),
+                None => this.check_updates(cx),
+            }))
+            .child(if matches!(self.update_state, UpdateState::Available { .. }) { "Open download page" } else { "Check for updates" });
+        column = column.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .p(px(16.))
+                .rounded(px(12.))
+                .bg(rgb(t.raised))
+                .border_1()
+                .border_color(rgb(t.line))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap(px(16.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
+                                .child(
+                                    div()
+                                        .font_family(SERIF)
+                                        .text_size(px(16.))
+                                        .text_color(rgb(t.ink))
+                                        .child(format!("Notary {}", updates::CURRENT)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .line_height(px(19.))
+                                        .text_color(rgb(t.soft))
+                                        .child("Notary contacts github.com only when you press Check for updates."),
+                                ),
+                        )
+                        .child(update_button),
+                )
+                .when(!update_text.is_empty(), |d| {
+                    d.child(div().text_size(px(12.5)).text_color(rgb(update_color)).child(update_text))
+                }),
+        );
         column = column.child(
             div()
                 .flex()

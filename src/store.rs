@@ -47,6 +47,12 @@ impl Store {
                 title TEXT NOT NULL,
                 body TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS vectors (
+                key TEXT PRIMARY KEY,
+                meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                hash TEXT NOT NULL,
+                vec BLOB NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS actions (
                 id INTEGER PRIMARY KEY,
                 meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
@@ -131,6 +137,30 @@ impl Store {
         }
         tx.commit()?;
         Ok(ids)
+    }
+
+    /// Every saved meaning vector, by passage key, with the hash of the text it was made from.
+    pub fn load_vectors(&self) -> Result<std::collections::HashMap<String, (String, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare("SELECT key, hash, vec FROM vectors")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (key, hash, blob) = row?;
+            out.insert(key, (hash, crate::semantic::from_blob(&blob)));
+        }
+        Ok(out)
+    }
+
+    pub fn save_vectors(&self, rows: &[(String, i64, String, Vec<f32>)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (key, meeting_id, hash, vec) in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO vectors (key, meeting_id, hash, vec) VALUES (?1, ?2, ?3, ?4)",
+                params![key, meeting_id, hash, crate::semantic::to_blob(vec)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn set_action_done(&self, action_id: i64, done: bool) -> Result<()> {

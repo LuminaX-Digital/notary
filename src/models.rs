@@ -14,11 +14,13 @@ use std::time::{Duration, Instant};
 pub enum Kind {
     Speech,
     Summary,
+    Embedding,
 }
 
-pub const ALL: [Kind; 2] = [Kind::Speech, Kind::Summary];
+pub const ALL: [Kind; 3] = [Kind::Speech, Kind::Summary, Kind::Embedding];
 
 pub struct Spec {
+    pub id: &'static str,
     pub name: &'static str,
     pub blurb: &'static str,
     pub file: &'static str,
@@ -29,6 +31,7 @@ pub struct Spec {
 }
 
 const SPEECH: Spec = Spec {
+    id: "speech",
     name: "Speech recognition",
     blurb: "Whisper large-v3-turbo. Turns what you hear and say into text, in English, German and many other languages. Needed to record.",
     file: "ggml-large-v3-turbo-q5_0.bin",
@@ -39,6 +42,7 @@ const SPEECH: Spec = Spec {
 };
 
 const SUMMARY: Spec = Spec {
+    id: "summary",
     name: "Summaries",
     blurb: "Qwen3 4B Instruct. Writes a title, summary, decisions and next steps after a recording. Optional.",
     file: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
@@ -48,10 +52,22 @@ const SUMMARY: Spec = Spec {
     env: "NOTARY_LLM",
 };
 
+const EMBEDDING: Spec = Spec {
+    id: "embedding",
+    name: "Search by meaning",
+    blurb: "multilingual-e5-small. Lets Ask find passages by meaning, so a question about a deadline also finds a talk about a due date. Optional.",
+    file: "multilingual-e5-small-q8_0.gguf",
+    url: "https://huggingface.co/cstr/multilingual-e5-small-GGUF/resolve/main/multilingual-e5-small-q8_0.gguf",
+    size: 131_624_960,
+    sha256: "0a34067a40f25d3149b36885faa62bee0e5284d0f9edc102acfc00e115d953e8",
+    env: "NOTARY_EMBED",
+};
+
 pub fn spec(kind: Kind) -> &'static Spec {
     match kind {
         Kind::Speech => &SPEECH,
         Kind::Summary => &SUMMARY,
+        Kind::Embedding => &EMBEDDING,
     }
 }
 

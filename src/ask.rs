@@ -1,15 +1,19 @@
 //! Asking questions across meetings: pick the passages that matter, let the local model answer from them.
 
 use crate::data::{Meeting, Speaker};
-use crate::summarizer;
+use crate::{semantic, summarizer};
 use anyhow::Result;
 use futures::channel::oneshot;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 const WINDOW: usize = 4;
 const STEP: usize = 2;
 const MAX_PER_MEETING: usize = 3;
 const MAX_CHARS: usize = 1400;
+const RANK_DEPTH: usize = 20;
+const RRF_K: f32 = 60.0;
 
 pub struct Source {
     pub meeting_id: i64,
@@ -52,6 +56,7 @@ fn keys(question: &str) -> Vec<String> {
 
 struct Chunk {
     meeting: usize,
+    key: String,
     text: String,
     lower: String,
 }
@@ -59,14 +64,18 @@ struct Chunk {
 fn chunks(meetings: &[Meeting]) -> Vec<Chunk> {
     let mut out = Vec::new();
     for (mi, m) in meetings.iter().enumerate() {
+        let mut n = 0;
+        let mut push = |text: String, out: &mut Vec<Chunk>| {
+            out.push(Chunk { meeting: mi, key: format!("{}:{}", m.id, n), lower: fold(&text), text });
+            n += 1;
+        };
         let notes: Vec<String> = m.summary.iter().map(|(t, b)| format!("{t}: {b}")).collect();
         let mut notes_text = notes.join("\n");
         for a in &m.actions {
             notes_text.push_str(&format!("\nTask: {} ({})", a.label, a.owner));
         }
         if !notes_text.is_empty() {
-            let text = format!("Notes of \"{}\":\n{}", m.title, notes_text);
-            out.push(Chunk { meeting: mi, lower: fold(&text), text });
+            push(format!("Notes of \"{}\":\n{}", m.title, notes_text), &mut out);
         }
         let spoken: Vec<String> = m
             .lines
@@ -77,8 +86,7 @@ fn chunks(meetings: &[Meeting]) -> Vec<Chunk> {
         let mut start = 0;
         while start < spoken.len() {
             let end = (start + WINDOW).min(spoken.len());
-            let text = spoken[start..end].join("\n");
-            out.push(Chunk { meeting: mi, lower: fold(&text), text });
+            push(spoken[start..end].join("\n"), &mut out);
             if end == spoken.len() {
                 break;
             }
@@ -88,43 +96,97 @@ fn chunks(meetings: &[Meeting]) -> Vec<Chunk> {
     out
 }
 
-/// The most relevant passages for a question, best first.
-pub fn retrieve(meetings: &[Meeting], question: &str, max: usize) -> Vec<Source> {
+/// A passage that gets a meaning vector.
+#[derive(Clone)]
+pub struct IndexChunk {
+    pub key: String,
+    pub meeting_id: i64,
+    pub hash: String,
+    pub text: String,
+}
+
+fn hash(text: &str) -> String {
+    Sha256::digest(text.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// All passages of all meetings, with a stable key and a hash that changes when the text does.
+pub fn index_chunks(meetings: &[Meeting]) -> Vec<IndexChunk> {
+    chunks(meetings)
+        .into_iter()
+        .map(|c| IndexChunk { key: c.key, meeting_id: meetings[c.meeting].id, hash: hash(&c.text), text: c.text })
+        .collect()
+}
+
+/// The question's meaning vector and the vectors of the passages, by passage key.
+pub struct Semantic {
+    pub query: Vec<f32>,
+    pub vectors: HashMap<String, Vec<f32>>,
+}
+
+/// The most relevant passages for a question, best first. Word matches and, when available,
+/// matches by meaning are merged with reciprocal rank fusion.
+pub fn retrieve(meetings: &[Meeting], question: &str, max: usize, semantic: Option<&Semantic>) -> Vec<Source> {
     let keys = keys(question);
-    if keys.is_empty() {
+    if keys.is_empty() && semantic.is_none() {
         return Vec::new();
     }
     let all = chunks(meetings);
-    let total = all.len() as f32;
-    let weights: Vec<f32> = keys
-        .iter()
-        .map(|k| {
-            let df = all.iter().filter(|c| c.lower.contains(k.as_str())).count() as f32;
-            (1.0 + total / (1.0 + df)).ln()
-        })
-        .collect();
+    let newer = |a: usize, b: usize| meetings[all[b].meeting].started.cmp(&meetings[all[a].meeting].started);
 
-    let mut scored: Vec<(f32, usize)> = all
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| {
-            let score: f32 = keys
-                .iter()
-                .zip(&weights)
-                .map(|(k, w)| (c.lower.matches(k.as_str()).count().min(3) as f32) * w)
-                .sum();
-            (score > 0.0).then_some((score, i))
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(meetings[all[b.1].meeting].started.cmp(&meetings[all[a.1].meeting].started))
-    });
+    let mut keyword: Vec<(f32, usize)> = Vec::new();
+    if !keys.is_empty() {
+        let total = all.len() as f32;
+        let weights: Vec<f32> = keys
+            .iter()
+            .map(|k| {
+                let df = all.iter().filter(|c| c.lower.contains(k.as_str())).count() as f32;
+                (1.0 + total / (1.0 + df)).ln()
+            })
+            .collect();
+        keyword = all
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let score: f32 = keys
+                    .iter()
+                    .zip(&weights)
+                    .map(|(k, w)| (c.lower.matches(k.as_str()).count().min(3) as f32) * w)
+                    .sum();
+                (score > 0.0).then_some((score, i))
+            })
+            .collect();
+        keyword.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(newer(a.1, b.1)));
+    }
 
-    let mut per_meeting = std::collections::HashMap::new();
+    let mut meaning: Vec<(f32, usize)> = semantic
+        .map(|s| {
+            all.iter()
+                .enumerate()
+                .filter_map(|(i, c)| s.vectors.get(&c.key).map(|v| (semantic::dot(&s.query, v), i)))
+                .collect()
+        })
+        .unwrap_or_default();
+    meaning.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(newer(a.1, b.1)));
+    meaning.truncate(RANK_DEPTH);
+
+    let order: Vec<usize> = if meaning.is_empty() {
+        keyword.into_iter().map(|(_, i)| i).collect()
+    } else {
+        let mut fused: HashMap<usize, f32> = HashMap::new();
+        for (rank, (_, i)) in keyword.iter().enumerate() {
+            *fused.entry(*i).or_default() += 1.0 / (RRF_K + rank as f32);
+        }
+        for (rank, (_, i)) in meaning.iter().enumerate() {
+            *fused.entry(*i).or_default() += 1.0 / (RRF_K + rank as f32);
+        }
+        let mut v: Vec<(f32, usize)> = fused.into_iter().map(|(i, s)| (s, i)).collect();
+        v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(newer(a.1, b.1)));
+        v.into_iter().map(|(_, i)| i).collect()
+    };
+
+    let mut per_meeting = HashMap::new();
     let mut picked = Vec::new();
-    for (_, i) in scored {
+    for i in order {
         let c = &all[i];
         let n = per_meeting.entry(c.meeting).or_insert(0);
         if *n >= MAX_PER_MEETING {
@@ -223,28 +285,71 @@ mod tests {
 
     #[test]
     fn finds_the_english_passage() {
-        let s = retrieve(&library(), "When does the MCP server move to v0.4?", 4);
+        let s = retrieve(&library(), "When does the MCP server move to v0.4?", 4, None);
         assert_eq!(s[0].meeting_id, 1);
         assert!(s[0].text.contains("December 4"));
     }
 
     #[test]
     fn finds_the_german_passage() {
-        let s = retrieve(&library(), "Wer baut die Checkbox bis wann ein?", 4);
+        let s = retrieve(&library(), "Wer baut die Checkbox bis wann ein?", 4, None);
         assert_eq!(s[0].meeting_id, 2);
         assert!(s[0].text.contains("Freitag"));
     }
 
     #[test]
     fn matches_word_forms() {
-        let s = retrieve(&library(), "Welche Verträge gibt es?", 4);
+        let s = retrieve(&library(), "Welche Verträge gibt es?", 4, None);
         assert!(s.iter().any(|x| x.meeting_id == 2));
     }
 
     #[test]
     fn returns_nothing_when_no_word_matches() {
-        assert!(retrieve(&library(), "What is the weather?", 4).is_empty());
-        assert!(retrieve(&library(), "Wie ist das?", 4).is_empty());
+        assert!(retrieve(&library(), "What is the weather?", 4, None).is_empty());
+        assert!(retrieve(&library(), "Wie ist das?", 4, None).is_empty());
+    }
+
+    #[test]
+    fn meaning_finds_passages_without_a_shared_word() {
+        let lib = library();
+        let chunks = index_chunks(&lib);
+        // Pretend the model says the question is closest to the German checkout passage.
+        let target = chunks.iter().find(|c| c.text.contains("Checkbox")).unwrap().key.clone();
+        let mut vectors = HashMap::new();
+        for c in &chunks {
+            vectors.insert(c.key.clone(), if c.key == target { vec![1.0, 0.0] } else { vec![0.0, 1.0] });
+        }
+        let sem = Semantic { query: vec![1.0, 0.0], vectors };
+        assert!(retrieve(&lib, "Was ist der Liefertermin?", 4, None).is_empty());
+        let s = retrieve(&lib, "Was ist der Liefertermin?", 4, Some(&sem));
+        assert_eq!(s[0].meeting_id, 2);
+        assert!(s[0].text.contains("Checkbox"));
+    }
+
+    #[test]
+    fn word_matches_and_meaning_are_merged() {
+        let lib = library();
+        let chunks = index_chunks(&lib);
+        let mut vectors = HashMap::new();
+        for c in &chunks {
+            vectors.insert(c.key.clone(), vec![0.0, 1.0]);
+        }
+        let sem = Semantic { query: vec![1.0, 0.0], vectors };
+        let s = retrieve(&lib, "When does the MCP server move to v0.4?", 4, Some(&sem));
+        assert_eq!(s[0].meeting_id, 1);
+    }
+
+    #[test]
+    fn passage_hashes_change_with_the_text() {
+        let a = index_chunks(&library());
+        let mut changed = library();
+        changed[0].lines.push(line("00:30", "Lena", Speaker::Other, "A new remark."));
+        let b = index_chunks(&changed);
+        assert_ne!(
+            a.iter().map(|c| c.hash.clone()).collect::<Vec<_>>(),
+            b.iter().map(|c| c.hash.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(a[0].key, b[0].key);
     }
 
     #[test]
@@ -255,7 +360,7 @@ mod tests {
 
     #[test]
     fn numbers_the_sources_in_the_prompt() {
-        let s = retrieve(&library(), "beta December", 4);
+        let s = retrieve(&library(), "beta December", 4, None);
         let p = prompt_input("When is the beta?", &s);
         assert!(p.starts_with("Sources:\n[1] Meeting"));
         assert!(p.ends_with("Question: When is the beta?\n"));
