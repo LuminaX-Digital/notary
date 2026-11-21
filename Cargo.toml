@@ -1,6 +1,6 @@
 [package]
 name = "notary"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Private meeting notes for Mac, written in Rust with GPUI"
 license = "MIT"

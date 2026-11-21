@@ -1025,7 +1025,7 @@ impl Notary {
             let job = native::in_background(move || {
                 let _ = std::fs::remove_file(&target);
                 let out = std::process::Command::new("/usr/bin/ditto")
-                    .args(["-c", "-k", "--keepParent"])
+                    .args(["-c", "-k", "--keepParent", "--norsrc", "--noextattr", "--noqtn"])
                     .arg(&source)
                     .arg(&target)
                     .output()?;

@@ -23,7 +23,13 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 | Ask questions across all meetings, answered with sources, in English or German | Works |
 | Ask finds passages by meaning as well as by words (optional 131 MB model) | Works |
 | Manual update check (contacts github.com only when you press it) | Works |
-| Speaker names | Planned |
+| Speaker names from Zoom, Teams and Google Meet windows | Built, tested on fixtures only; needs live calls and the Accessibility permission |
+| Offer to record when a call app uses the microphone, stop when the call ends | Built, tested with a fake clock; needs live calls |
+| Audio kept per meeting (small AAC files), copy, export, folders, rename, notes | Works |
+| Trash with 30 days to restore, ZIP backup | Works |
+| Calendar: coming up, titles and attendees from the matching event | Built; needs the Calendar permission to try |
+| Your name, spoken language, summary language, custom words, permissions | Works |
+| Playback, MCP server, menu bar, pause, audio import | Planned |
 | Windows and Linux | Not planned for v1 |
 
 ## Requirements
@@ -68,7 +74,7 @@ This builds `dist/Notary.app` and `dist/Notary.dmg`, ad-hoc signed so it runs on
 SIGN_ID="Developer ID Application: Your Name (TEAMID)" NOTARY_PROFILE=<profile> scripts/bundle.sh
 ```
 
-The script signs the helper program first and the app second, uses the hardened runtime, signs the disk image, sends it to Apple, staples the ticket and checks the result with `spctl`. Create the notarization profile once with `xcrun notarytool store-credentials <profile>`. `scripts/make-icon.swift` redraws the app icon.
+The script builds the native helper `notary-mac` (Swift; accessibility, calendar and microphone use), signs the helpers first and the app second, uses the hardened runtime, signs the disk image, sends it to Apple, staples the ticket and checks the result with `spctl`. Create the notarization profile once with `xcrun notarytool store-credentials <profile>`. `scripts/make-icon.swift` redraws the app icon.
 
 ## Privacy
 
