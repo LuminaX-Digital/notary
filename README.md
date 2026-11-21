@@ -6,7 +6,7 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 
 **[Download Notary for Mac](https://github.com/LuminaX-Digital/notary/releases/latest)** (signed and notarized, Apple Silicon, macOS 14.4 or newer)
 
-> **Early development.** You can record, watch a live transcript in English and German, and come back to your saved meetings later. Search and "ask across meetings" are not built yet. See the status list below.
+> **Early development.** You can record, watch a live transcript in English and German, get a summary, search your meetings and ask questions across them. Expect rough edges; the status list below says what is still missing.
 
 ## Status
 
