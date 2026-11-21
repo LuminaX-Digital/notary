@@ -7,6 +7,7 @@ mod calls;
 mod engine;
 mod export;
 mod input;
+mod mcp;
 mod models;
 mod native;
 mod search;
@@ -2088,6 +2089,31 @@ impl Notary {
             .child(perm_row("Microphone", "Picks up your own voice.", p.map(|p| p.microphone == "authorized"), "microphone", cx))
             .child(perm_row("Accessibility", "Reads who is speaking from the Zoom, Teams or Meet window. Nothing else is read.", p.map(|p| p.accessibility), "accessibility", cx))
             .child(perm_row("Calendar", "Shows your next meetings and names recordings after them.", p.map(|p| p.calendar == "fullAccess"), "calendar", cx));
+        let command = std::env::current_exe().map(|p| format!("\"{}\" mcp", p.display())).unwrap_or_else(|_| "Notary mcp".to_string());
+        let ai = Self::settings_card(t)
+            .child(div().font_family(SERIF).text_size(px(16.)).text_color(rgb(t.ink)).child("AI apps"))
+            .child(toggle("t-mcp", "Let AI apps read your meetings", "Lets an app you connect, such as Claude or Cursor, search and read your notes and transcripts. Read only. Off by default.", s.mcp_enabled, |s| &mut s.mcp_enabled, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(16.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(label("Command to add to your AI app"))
+                            .child(div().font_family(MONO).text_size(px(11.5)).line_height(px(17.)).text_color(rgb(t.soft)).child(command.clone())),
+                    )
+                    .child(Self::pill("copy-mcp".into(), "Copy".into(), false, t).on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
+                        this.status = "Command copied".into();
+                        cx.notify();
+                    }))),
+            );
         let data = Self::settings_card(t)
             .child(div().font_family(SERIF).text_size(px(16.)).text_color(rgb(t.ink)).child("Your data"))
             .child(
@@ -2107,7 +2133,7 @@ impl Notary {
                     )
                     .child(Self::pill("backup".into(), "Back up\u{2026}".into(), true, t).on_click(cx.listener(|this, _, _, cx| this.back_up(cx)))),
             );
-        div().flex().flex_col().gap(px(16.)).child(you).child(recording).child(language).child(permissions).child(data)
+        div().flex().flex_col().gap(px(16.)).child(you).child(recording).child(language).child(permissions).child(ai).child(data)
     }
 
     fn model_row(&self, kind: Kind, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3090,6 +3116,10 @@ impl Render for Notary {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        mcp::serve();
+        return;
+    }
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
         cx.open_window(

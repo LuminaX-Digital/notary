@@ -22,7 +22,7 @@ pub struct Settings {
     pub keep_audio: bool,
     pub stop_when_call_ends: bool,
     pub offer_to_record: bool,
-    pub ai_apps: bool,
+    pub mcp_enabled: bool,
     pub hide_events_without_link: bool,
     pub hidden_calendars: Vec<String>,
 }
@@ -41,7 +41,7 @@ impl Default for Settings {
             keep_audio: true,
             stop_when_call_ends: true,
             offer_to_record: true,
-            ai_apps: false,
+            mcp_enabled: false,
             hide_events_without_link: false,
             hidden_calendars: Vec::new(),
         }
@@ -122,7 +122,7 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"your_name":"Fabian"}"#).unwrap();
         assert_eq!(s.your_name, "Fabian");
         assert_eq!(s.spoken, Spoken::Multi);
-        assert!(s.keep_audio && !s.ai_apps);
+        assert!(s.keep_audio && !s.mcp_enabled);
     }
 
     #[test]
