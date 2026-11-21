@@ -142,6 +142,9 @@ struct Notary {
     warned_accessibility: bool,
     perms: Option<native::Status>,
     perms_busy: bool,
+    events: Vec<native::CalendarEvent>,
+    pending_event: Option<String>,
+    event_people: Vec<String>,
 }
 
 fn clock(secs: f32) -> String {
@@ -166,6 +169,7 @@ impl Notary {
         let mut words_input = TextInput::default();
         words_input.set(&settings.custom_words);
         Self::watch_microphone(cx);
+        Self::watch_calendar(cx);
         Self {
             settings,
             name_input,
@@ -215,6 +219,9 @@ impl Notary {
             warned_accessibility: false,
             perms: None,
             perms_busy: false,
+            events: Vec::new(),
+            pending_event: None,
+            event_people: Vec::new(),
         }
     }
 
@@ -229,6 +236,53 @@ impl Notary {
             }
         })
         .detach();
+    }
+
+    /// Reads the next day of calendar events now and every few minutes, when the Calendar permission is given.
+    fn watch_calendar(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let from = chrono::Local::now() - chrono::Duration::minutes(15);
+                let to = from + chrono::Duration::hours(26);
+                let fmt = |d: chrono::DateTime<chrono::Local>| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+                let (from, to) = (fmt(from), fmt(to));
+                let rx = native::in_background(move || {
+                    if native::status()?.calendar != "fullAccess" {
+                        anyhow::bail!("calendar-not-authorized");
+                    }
+                    native::events(&from, &to)
+                });
+                if let Ok(Ok(events)) = rx.await {
+                    if this.update(cx, |this, cx| {
+                        this.events = events;
+                        cx.notify();
+                    }).is_err() {
+                        break;
+                    }
+                }
+                cx.background_executor().timer(std::time::Duration::from_secs(240)).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Events to show and to match: not declined, not in a hidden calendar.
+    fn shown_events(&self) -> Vec<&native::CalendarEvent> {
+        calendar::visible(&self.events, &self.settings.hidden_calendars, self.settings.hide_events_without_link)
+    }
+
+    /// The call app a calendar event's link belongs to, so its speaker names can be read.
+    fn app_for_event(e: &native::CalendarEvent) -> Option<calls::CallApp> {
+        let link = calendar::meeting_link(e)?;
+        if link.contains("zoom.") {
+            Some(calls::CallApp::Zoom)
+        } else if link.contains("teams.") {
+            Some(calls::CallApp::Teams)
+        } else if link.contains("meet.google.") {
+            Some(calls::CallApp::Browser)
+        } else {
+            None
+        }
     }
 
     fn on_mic(&mut self, on_mic: Vec<calls::CallApp>, cx: &mut Context<Self>) {
@@ -295,7 +349,12 @@ impl Notary {
         timeline.push(sample);
         if timeline.seen.len() != before {
             let mine = self.settings.your_name.clone();
-            let people: Vec<String> = timeline.seen.iter().filter(|p| **p != mine).cloned().collect();
+            let mut people = self.event_people.clone();
+            for p in timeline.seen.iter().filter(|p| **p != mine) {
+                if !people.contains(p) {
+                    people.push(p.clone());
+                }
+            }
             if let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) {
                 m.people = people.clone();
             }
@@ -364,6 +423,41 @@ impl Notary {
         self.timeline = None;
         self.call_watch = None;
         self.warned_accessibility = false;
+        let now_s = chrono::Local::now().timestamp();
+        let wanted = self.pending_event.take();
+        let event = {
+            let shown = self.shown_events();
+            match wanted {
+                Some(id) => shown.iter().copied().find(|e| e.id == id),
+                None => calendar::match_event(&shown, now_s),
+            }
+            .cloned()
+        };
+        self.event_people.clear();
+        if let Some(e) = &event {
+            if self.pending_bound.is_none() {
+                self.pending_bound = Self::app_for_event(e);
+            }
+            let me = e.me.clone().unwrap_or_default();
+            self.event_people = e
+                .attendees
+                .iter()
+                .filter(|a| a.name != self.settings.your_name && (me.is_empty() || a.email != me))
+                .map(|a| if a.name.is_empty() { a.email.split('@').next().unwrap_or("").to_string() } else { a.name.clone() })
+                .filter(|n| !n.is_empty())
+                .take(50)
+                .collect();
+            if let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) {
+                m.title = e.title.clone().into();
+                m.people = self.event_people.clone();
+            }
+            if let Some(store) = &self.store {
+                let renamed = store.rename_meeting(id, &e.title);
+                let people = store.set_people(id, &self.event_people);
+                self.save(renamed);
+                self.save(people);
+            }
+        }
         self.call_bound = self.pending_bound.take();
         if let Some(app) = self.call_bound {
             self.begin_call_watch(app, id, cx);
@@ -1188,6 +1282,38 @@ impl Notary {
         let mut items = div().id("meetings").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().px(px(6.)).pb(px(10.));
         let mut last_day = String::new();
         let mut shown = 0;
+        let coming: Vec<native::CalendarEvent> = if terms.is_empty() && self.recording.is_none() {
+            let shown = self.shown_events();
+            calendar::upcoming(&shown, chrono::Local::now().timestamp(), 3).into_iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        if !coming.is_empty() {
+            items = items.child(div().px(px(8.)).pt(px(14.)).pb(px(4.)).text_size(px(11.)).text_color(rgb(t.faint)).child("COMING UP"));
+            for e in coming {
+                let time = calendar::start_ts(&e)
+                    .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+                    .map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                    .unwrap_or_default();
+                let id = e.id.clone();
+                items = items.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px(px(10.))
+                        .py(px(7.))
+                        .child(div().font_family(MONO).text_size(px(11.)).text_color(rgb(t.faint)).child(time))
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(rgb(t.soft)).child(e.title.clone()))
+                        .child(
+                            Self::pill(format!("event-{}", e.id).into(), "Record".into(), false, t).on_click(cx.listener(move |this, _, _, cx| {
+                                this.pending_event = Some(id.clone());
+                                this.toggle_recording(cx);
+                            })),
+                        ),
+                );
+            }
+        }
         for (i, m) in self.meetings.iter().enumerate() {
             if self.folder_filter.is_some() && m.folder != self.folder_filter {
                 continue;
