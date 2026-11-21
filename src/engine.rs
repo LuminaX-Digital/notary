@@ -1,6 +1,7 @@
 //! Records system audio and the microphone with ScreenCaptureKit and transcribes both with whisper
 //! on a background thread.
 
+use crate::audio;
 use anyhow::{Context, Result};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use screencapturekit::prelude::*;
@@ -49,12 +50,21 @@ pub fn model_path() -> Option<PathBuf> {
     crate::models::find(crate::models::Kind::Speech)
 }
 
-pub fn start(model: PathBuf) -> (Recording, UnboundedReceiver<Event>) {
+/// What the user chose about speech: the whisper language code and words that help it spell.
+#[derive(Clone)]
+pub struct Config {
+    pub language: String,
+    pub prompt: String,
+    /// Where to save the audio of this recording; None keeps no audio.
+    pub audio_dir: Option<PathBuf>,
+}
+
+pub fn start(model: PathBuf, config: Config) -> (Recording, UnboundedReceiver<Event>) {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = unbounded();
     let flag = stop.clone();
     std::thread::spawn(move || {
-        if let Err(e) = run(model, flag, &tx) {
+        if let Err(e) = run(model, config, flag, &tx) {
             let _ = tx.unbounded_send(Event::Failed(format!("{e:#}")));
         }
         let _ = tx.unbounded_send(Event::Stopped);
@@ -185,7 +195,7 @@ fn base_config() -> SCStreamConfiguration {
         .with_channel_count(1)
 }
 
-fn run(model: PathBuf, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -> Result<()> {
+fn run(model: PathBuf, speech: Config, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -> Result<()> {
     let _ = events.unbounded_send(Event::Loading);
     let ctx = WhisperContext::new_with_params(
         model.to_str().context("model path is not valid UTF-8")?,
@@ -218,13 +228,23 @@ fn run(model: PathBuf, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -
     let _ = events.unbounded_send(Event::Listening { mic: mic_on });
 
     let mut lanes = [Lane::new(Source::System), Lane::new(Source::Mic)];
+    let mut wavs: [Option<audio::Wav>; 2] = [None, None];
+    if let Some(dir) = &speech.audio_dir {
+        wavs[Source::System as usize] = audio::Wav::create(&dir.join("them.wav")).ok();
+        wavs[Source::Mic as usize] = audio::Wav::create(&dir.join("me.wav")).ok();
+    }
     let mut system_lines: Vec<(f32, HashSet<String>)> = Vec::new();
     let mut stopping = false;
 
     loop {
         if !stopping {
             match audio_rx.recv_timeout(Duration::from_millis(150)) {
-                Ok((source, samples)) => lanes[source as usize].buf.extend(samples),
+                Ok((source, samples)) => {
+                    if let Some(w) = wavs[source as usize].as_mut() {
+                        let _ = w.write(&samples);
+                    }
+                    lanes[source as usize].buf.extend(samples)
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("Audio capture stopped unexpectedly. If you changed your sound output, press Record again.")
@@ -234,6 +254,9 @@ fn run(model: PathBuf, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -
                 stopping = true;
                 let _ = stream.stop_capture();
                 for (source, samples) in audio_rx.try_iter() {
+                    if let Some(w) = wavs[source as usize].as_mut() {
+                        let _ = w.write(&samples);
+                    }
                     lanes[source as usize].buf.extend(samples);
                 }
             }
@@ -245,7 +268,10 @@ fn run(model: PathBuf, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -
                     continue;
                 }
                 let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-                params.set_language(Some("auto"));
+                params.set_language(Some(&speech.language));
+                if !speech.prompt.is_empty() {
+                    params.set_initial_prompt(&speech.prompt);
+                }
                 params.set_print_special(false);
                 params.set_print_progress(false);
                 params.set_print_realtime(false);
@@ -280,6 +306,13 @@ fn run(model: PathBuf, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -
         if stopping {
             break;
         }
+    }
+    for w in wavs.into_iter().flatten() {
+        let _ = w.finish();
+    }
+    if let Some(dir) = &speech.audio_dir {
+        audio::compress(dir, "me");
+        audio::compress(dir, "them");
     }
     Ok(())
 }

@@ -1,11 +1,17 @@
 mod data;
 mod ask;
+mod audio;
+mod calendar;
+mod callnames;
+mod calls;
 mod engine;
 mod export;
 mod input;
 mod models;
+mod native;
 mod search;
 mod semantic;
+mod settings;
 mod store;
 mod summarizer;
 mod theme;
@@ -15,6 +21,7 @@ use data::{Action, Folder, Meeting, Speaker, line};
 use engine::{Event, Recording, Source};
 use input::{Outcome, TextInput};
 use models::{Download, Kind, Progress};
+use settings::{SUMMARY_LANGUAGES, Settings, Spoken};
 use futures::StreamExt;
 use gpui::{
     AnyElement, App, Application, Bounds, ClipboardItem, FocusHandle, KeyDownEvent, Context, FontWeight, IntoElement, Render, ScrollHandle,
@@ -86,6 +93,11 @@ fn field_text(input: &TextInput, placeholder: &'static str, max_chars: usize, si
 }
 
 struct Notary {
+    settings: Settings,
+    name_input: TextInput,
+    focus_name: FocusHandle,
+    words_input: TextInput,
+    focus_words: FocusHandle,
     folders: Vec<Folder>,
     folder_filter: Option<i64>,
     adding_folder: bool,
@@ -135,7 +147,17 @@ impl Notary {
             }
         };
         let folders = store.as_ref().and_then(|s| s.load_folders().ok()).unwrap_or_default();
+        let settings = Settings::load();
+        let mut name_input = TextInput::default();
+        name_input.set(&settings.your_name);
+        let mut words_input = TextInput::default();
+        words_input.set(&settings.custom_words);
         Self {
+            settings,
+            name_input,
+            focus_name: cx.focus_handle(),
+            words_input,
+            focus_words: cx.focus_handle(),
             folders,
             folder_filter: None,
             adding_folder: false,
@@ -209,7 +231,14 @@ impl Notary {
         self.selected = 0;
         self.confirm_delete = None;
 
-        let (rec, mut events) = engine::start(model);
+        let (rec, mut events) = engine::start(
+            model,
+            engine::Config {
+                language: self.settings.whisper_language().to_string(),
+                prompt: self.settings.prompt_words(),
+                audio_dir: self.settings.keep_audio.then(|| audio::meeting_dir(id)),
+            },
+        );
         self.recording = Some(rec);
         self.status = "Loading the model".into();
 
@@ -237,10 +266,10 @@ impl Notary {
             }
             Event::Segment { source, start, text } => {
                 let (name, who) = match source {
-                    Source::System => ("Call audio", Speaker::Other),
-                    Source::Mic => ("You", Speaker::Me),
+                    Source::System => ("Call audio".to_string(), Speaker::Other),
+                    Source::Mic => (self.settings.your_name.clone(), Speaker::Me),
                 };
-                let l = line(&clock(start), name, who, &text);
+                let l = line(&clock(start), &name, who, &text);
                 let saved = self.store.as_ref().map(|s| s.add_line(id, &l));
                 if let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) {
                     m.lines.push(l);
@@ -414,7 +443,7 @@ impl Notary {
         m.summarizing = true;
         let transcript = m.transcript_text();
         self.status = "Writing the summary on this Mac".into();
-        let rx = summarizer::summarize(model, transcript);
+        let rx = summarizer::summarize(model, transcript, self.settings.forced_summary_language().map(str::to_string));
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |this, cx| this.apply_notes(id, result, cx));
@@ -499,6 +528,7 @@ impl Notary {
             let result = store.delete_meeting(id);
             self.save(result);
         }
+        audio::delete_audio(id);
         self.meetings.remove(self.selected);
         self.selected = self.selected.min(self.meetings.len().saturating_sub(1));
         self.confirm_delete = None;
@@ -662,6 +692,40 @@ impl Notary {
             Outcome::Nothing => return,
             Outcome::Escape => self.search.clear(),
             _ => {}
+        }
+        cx.notify();
+    }
+
+    fn persist_settings(&mut self) {
+        if let Err(e) = self.settings.save() {
+            self.status = format!("Could not save settings: {e:#}").into();
+        }
+    }
+
+    fn on_name_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        match Self::key_into(&mut self.name_input, ev, cx) {
+            Outcome::Nothing => return,
+            Outcome::Escape => self.name_input.set(&self.settings.your_name.clone()),
+            _ => {}
+        }
+        let name = self.name_input.text().trim().to_string();
+        if !name.is_empty() && name != self.settings.your_name {
+            self.settings.your_name = name;
+            self.persist_settings();
+        }
+        cx.notify();
+    }
+
+    fn on_words_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        match Self::key_into(&mut self.words_input, ev, cx) {
+            Outcome::Nothing => return,
+            Outcome::Escape => self.words_input.set(&self.settings.custom_words.clone()),
+            _ => {}
+        }
+        let words = self.words_input.text().to_string();
+        if words != self.settings.custom_words {
+            self.settings.custom_words = words;
+            self.persist_settings();
         }
         cx.notify();
     }
@@ -1270,6 +1334,118 @@ impl Notary {
             .into_any_element()
     }
 
+    fn settings_card(t: &Theme) -> gpui::Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .p(px(16.))
+            .rounded(px(12.))
+            .bg(rgb(t.raised))
+            .border_1()
+            .border_color(rgb(t.line))
+    }
+
+    fn input_shell(id: &'static str, focus: &FocusHandle, focused: bool, t: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let handle = focus.clone();
+        div()
+            .id(id)
+            .track_focus(focus)
+            .on_click(cx.listener(move |_, _, window, cx| {
+                window.focus(&handle);
+                cx.notify();
+            }))
+            .px(px(10.))
+            .py(px(7.))
+            .rounded(px(8.))
+            .bg(rgb(t.rail))
+            .border_1()
+            .border_color(rgb(if focused { t.accent } else { t.rail }))
+            .cursor_pointer()
+            .overflow_hidden()
+    }
+
+    fn pill(id: SharedString, label: SharedString, active: bool, t: &Theme) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .flex_none()
+            .px(px(10.))
+            .py(px(4.))
+            .rounded_full()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .when(active, |d| d.bg(rgb(t.accent_soft)).text_color(rgb(t.accent)))
+            .when(!active, |d| d.bg(rgb(t.rail)).text_color(rgb(t.soft)).hover(|h| h.text_color(rgb(t.accent))))
+            .child(label)
+    }
+
+    fn settings_cards(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = |s: &'static str| div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(t.ink)).child(s);
+        let hint = |s: &'static str| div().text_size(px(12.)).line_height(px(18.)).text_color(rgb(t.faint)).child(s);
+
+        let name_focused = self.focus_name.is_focused(window);
+        let words_focused = self.focus_words.is_focused(window);
+
+        let you = Self::settings_card(t)
+            .child(div().font_family(SERIF).text_size(px(16.)).text_color(rgb(t.ink)).child("You"))
+            .child(
+                div().flex().flex_col().gap(px(6.)).child(label("Your name")).child(
+                    Self::input_shell("name-input", &self.focus_name, name_focused, t, cx)
+                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_name_key(ev, cx)))
+                        .child(field_text(&self.name_input, "Your name", 40, 13., name_focused, t)),
+                ).child(hint("Shown next to the lines your microphone picks up.")),
+            );
+
+        let mut summary_pills = div().flex().flex_wrap().gap(px(6.));
+        for (i, language) in SUMMARY_LANGUAGES.iter().enumerate() {
+            let active = self.settings.summary_language == *language;
+            summary_pills = summary_pills.child(
+                Self::pill(format!("summary-lang-{i}").into(), (*language).into(), active, t).on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings.summary_language = SUMMARY_LANGUAGES[i].to_string();
+                    this.persist_settings();
+                    cx.notify();
+                })),
+            );
+        }
+        let spoken = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(label("Spoken language"))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .child(Self::pill("spoken-multi".into(), "Multi-language".into(), self.settings.spoken == Spoken::Multi, t).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.settings.spoken = Spoken::Multi;
+                            this.persist_settings();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::pill("spoken-en".into(), "English only".into(), self.settings.spoken == Spoken::EnglishOnly, t).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.settings.spoken = Spoken::EnglishOnly;
+                            this.persist_settings();
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(hint("English only is faster for English meetings. Multi-language detects the language of every phrase, so a meeting can switch between languages."));
+        let language = Self::settings_card(t)
+            .child(div().font_family(SERIF).text_size(px(16.)).text_color(rgb(t.ink)).child("Language"))
+            .child(spoken)
+            .child(div().flex().flex_col().gap(px(6.)).child(label("Summary language")).child(summary_pills))
+            .child(
+                div().flex().flex_col().gap(px(6.)).child(label("Custom words")).child(
+                    Self::input_shell("words-input", &self.focus_words, words_focused, t, cx)
+                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_words_key(ev, cx)))
+                        .child(field_text(&self.words_input, "Names and jargon, separated by commas", 60, 13., words_focused, t)),
+                ).child(hint("Helps Notary spell names, products and technical terms the way you do.")),
+            );
+        div().flex().flex_col().gap(px(16.)).child(you).child(language)
+    }
+
     fn model_row(&self, kind: Kind, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let spec = models::spec(kind);
         let installed = models::find(kind).is_some();
@@ -1389,7 +1565,7 @@ impl Notary {
         card
     }
 
-    fn setup_body(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn setup_body(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let ready = models::find(Kind::Speech).is_some();
         let busy = self.downloads.iter().any(|d| matches!(d, Dl::Active { .. }));
         let mut column = div()
@@ -1403,8 +1579,10 @@ impl Notary {
                     .font_family(SERIF)
                     .text_size(px(26.))
                     .text_color(rgb(t.ink))
-                    .child("Set up Notary"),
+                    .child(if ready { "Settings" } else { "Set up Notary" }),
             )
+            .child(self.settings_cards(t, window, cx))
+            .child(div().font_family(SERIF).text_size(px(18.)).text_color(rgb(t.ink)).child("Models"))
             .child(
                 div()
                     .text_size(px(14.))
@@ -1894,6 +2072,13 @@ impl Notary {
                                 .on_click(cx.listener(move |this, _, _, cx| this.copy_transcript(meeting_id, cx))),
                         )
                         .child(chip("export-md", "Export").on_click(cx.listener(move |this, _, _, cx| this.save_markdown(meeting_id, cx))))
+                        .when(audio::has_audio(meeting_id), |row| {
+                            row.child(chip("audio", "Audio").on_click(cx.listener(move |_, _, _, cx| {
+                                let dir = audio::meeting_dir(meeting_id);
+                                let file = ["them.m4a", "me.m4a"].iter().map(|n| dir.join(n)).find(|p| p.exists());
+                                cx.reveal_path(&file.unwrap_or(dir));
+                            })))
+                        })
                         .child(chip("move", "Move").on_click(cx.listener(|this, _, _, cx| {
                             this.moving = !this.moving;
                             cx.notify();
@@ -1994,7 +2179,7 @@ impl Notary {
 
     fn view(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = if self.setup_open {
-            self.setup_body(t, cx)
+            self.setup_body(t, window, cx)
         } else if self.ask_open {
             self.ask_body(t, window, cx)
         } else {

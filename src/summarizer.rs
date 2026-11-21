@@ -27,10 +27,10 @@ fn helper_path() -> Result<PathBuf> {
 }
 
 /// Writes notes for `transcript` on a background thread; the result arrives on the returned channel.
-pub fn summarize(model: PathBuf, transcript: String) -> oneshot::Receiver<Result<Notes>> {
+pub fn summarize(model: PathBuf, transcript: String, language: Option<String>) -> oneshot::Receiver<Result<Notes>> {
     let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(run(&model, &transcript));
+        let _ = tx.send(run(&model, &transcript, language.as_deref()));
     });
     rx
 }
@@ -80,8 +80,8 @@ pub fn run_helper(model: &PathBuf, language: &str, mode: &str, input: &str) -> R
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn run(model: &PathBuf, transcript: &str) -> Result<Notes> {
-    let notes = parse(&run_helper(model, detect_language(transcript), "notes", transcript)?);
+fn run(model: &PathBuf, transcript: &str, language: Option<&str>) -> Result<Notes> {
+    let notes = parse(&run_helper(model, language.unwrap_or_else(|| detect_language(transcript)), "notes", transcript)?);
     if notes.sections.is_empty() && notes.actions.is_empty() {
         bail!("the model returned nothing usable");
     }
