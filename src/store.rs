@@ -77,7 +77,45 @@ impl Store {
         if has_people == 0 {
             conn.execute_batch("ALTER TABLE meetings ADD COLUMN people TEXT NOT NULL DEFAULT '';")?;
         }
+        let has_deleted: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name = 'deleted_at'", [], |r| r.get(0))?;
+        if has_deleted == 0 {
+            conn.execute_batch("ALTER TABLE meetings ADD COLUMN deleted_at INTEGER;")?;
+        }
         Ok(Self { conn })
+    }
+
+    /// Moves a meeting to the trash. It can be restored until it is purged.
+    pub fn trash_meeting(&self, meeting_id: i64, now: i64) -> Result<()> {
+        self.conn.execute("UPDATE meetings SET deleted_at = ?2 WHERE id = ?1", params![meeting_id, now])?;
+        Ok(())
+    }
+
+    pub fn restore_meeting(&self, meeting_id: i64) -> Result<()> {
+        self.conn.execute("UPDATE meetings SET deleted_at = NULL WHERE id = ?1", params![meeting_id])?;
+        Ok(())
+    }
+
+    /// (id, title, started, deleted_at) of trashed meetings, newest deletion first.
+    pub fn load_trash(&self) -> Result<Vec<(i64, String, i64, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, title, started, deleted_at FROM meetings WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Permanently deletes trashed meetings deleted before `cutoff`. Returns their ids.
+    pub fn purge_trash_before(&self, cutoff: i64) -> Result<Vec<i64>> {
+        let ids: Vec<i64> = {
+            let mut stmt = self.conn.prepare("SELECT id FROM meetings WHERE deleted_at IS NOT NULL AND deleted_at < ?1")?;
+            let rows = stmt.query_map([cutoff], |r| r.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in &ids {
+            self.delete_meeting(*id)?;
+        }
+        Ok(ids)
     }
 
     pub fn set_people(&self, meeting_id: i64, people: &[String]) -> Result<()> {
@@ -89,7 +127,7 @@ impl Store {
         let mut meetings = Vec::new();
         let mut stmt = self
             .conn
-            .prepare("SELECT id, title, started, folder_id, people FROM meetings ORDER BY started DESC")?;
+            .prepare("SELECT id, title, started, folder_id, people FROM meetings WHERE deleted_at IS NULL ORDER BY started DESC")?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, String>(4)?))
         })?;
@@ -259,6 +297,21 @@ mod tests {
 
     fn store() -> Store {
         Store::open_at(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn trashed_meetings_leave_the_list_and_can_come_back_or_be_purged() {
+        let s = store();
+        let a = s.create_meeting("Keep", 100).unwrap();
+        let b = s.create_meeting("Old", 200).unwrap();
+        s.trash_meeting(a, 1_000).unwrap();
+        s.trash_meeting(b, 5_000).unwrap();
+        assert!(s.load_meetings().unwrap().is_empty());
+        assert_eq!(s.load_trash().unwrap().len(), 2);
+        s.restore_meeting(a).unwrap();
+        assert_eq!(s.load_meetings().unwrap().len(), 1);
+        assert_eq!(s.purge_trash_before(9_000).unwrap(), vec![b]);
+        assert!(s.load_trash().unwrap().is_empty());
     }
 
     #[test]

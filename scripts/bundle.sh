@@ -30,11 +30,13 @@ TIMESTAMP=(--timestamp=none)
 [[ "$SIGN_ID" != "-" ]] && TIMESTAMP=(--timestamp)
 
 cargo build --release
+scripts/build-native.sh
 
 rm -rf dist
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/notary "$APP/Contents/MacOS/Notary"
 cp target/release/notary-llm "$APP/Contents/MacOS/notary-llm"
+cp target/release/notary-mac "$APP/Contents/MacOS/notary-mac"
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -54,6 +56,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSHumanReadableCopyright</key><string>&#169; 2026 Fabian Faraz Farid</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>Notary shows your next meetings and names a recording after the meeting it belongs to. Your calendar stays on this Mac.</string>
+  <key>NSCalendarsUsageDescription</key>
+  <string>Notary shows your next meetings and names a recording after the meeting it belongs to. Your calendar stays on this Mac.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Notary listens to your microphone so your own words appear in the transcript. Audio never leaves this Mac.</string>
 </dict>
@@ -66,12 +72,14 @@ cat > dist/entitlements.plist <<PLIST
 <plist version="1.0">
 <dict>
   <key>com.apple.security.device.audio-input</key><true/>
+  <key>com.apple.security.personal-information.calendars</key><true/>
 </dict>
 </plist>
 PLIST
 
 # Sign from the inside out: the helper first, then the app (no --deep).
 codesign --force --options runtime "${TIMESTAMP[@]}" --sign "$SIGN_ID" "$APP/Contents/MacOS/notary-llm"
+codesign --force --options runtime "${TIMESTAMP[@]}" --entitlements dist/entitlements.plist --sign "$SIGN_ID" "$APP/Contents/MacOS/notary-mac"
 codesign --force --options runtime "${TIMESTAMP[@]}" --entitlements dist/entitlements.plist --sign "$SIGN_ID" "$APP"
 codesign --verify --strict --verbose=1 "$APP"
 

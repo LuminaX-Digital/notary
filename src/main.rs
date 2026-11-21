@@ -36,6 +36,7 @@ const SANS: &str = ".SystemUIFont";
 const SERIF: &str = "Iowan Old Style";
 const MONO: &str = "Menlo";
 const DEFAULT_TITLE: &str = "New note";
+const TRASH_DAYS: i64 = 30;
 const MIN_WORDS_TO_SUMMARIZE: usize = 25;
 const STALL_HINT_SECS: u64 = 8;
 
@@ -145,6 +146,8 @@ struct Notary {
     events: Vec<native::CalendarEvent>,
     pending_event: Option<String>,
     event_people: Vec<String>,
+    trash_open: bool,
+    trash: Vec<(i64, String, i64, i64)>,
 }
 
 fn clock(secs: f32) -> String {
@@ -162,6 +165,13 @@ impl Notary {
                 (None, Vec::new())
             }
         };
+        if let Some(s) = &store {
+            let cutoff = chrono::Local::now().timestamp() - TRASH_DAYS * 86_400;
+            for id in s.purge_trash_before(cutoff).unwrap_or_default() {
+                audio::delete_audio(id);
+            }
+        }
+        let trash = store.as_ref().and_then(|s| s.load_trash().ok()).unwrap_or_default();
         let folders = store.as_ref().and_then(|s| s.load_folders().ok()).unwrap_or_default();
         let settings = Settings::load();
         let mut name_input = TextInput::default();
@@ -222,6 +232,8 @@ impl Notary {
             events: Vec::new(),
             pending_event: None,
             event_people: Vec::new(),
+            trash_open: false,
+            trash,
         }
     }
 
@@ -762,15 +774,40 @@ impl Notary {
             cx.notify();
             return;
         }
+        let now = chrono::Local::now().timestamp();
+        if let Some(store) = &self.store {
+            let result = store.trash_meeting(id, now);
+            self.save(result);
+        }
+        let gone = self.meetings.remove(self.selected);
+        self.trash.insert(0, (gone.id, gone.title.to_string(), gone.started, now));
+        self.selected = self.selected.min(self.meetings.len().saturating_sub(1));
+        self.confirm_delete = None;
+        self.status = format!("Moved to the trash. It is deleted for good after {TRASH_DAYS} days.").into();
+        cx.notify();
+    }
+
+    fn restore_from_trash(&mut self, id: i64, cx: &mut Context<Self>) {
+        let loaded = self.store.as_ref().map(|store| store.restore_meeting(id).and_then(|_| store.load_meetings()));
+        match loaded {
+            Some(Ok(list)) => self.meetings = list,
+            Some(Err(e)) => self.status = format!("Could not restore: {e:#}").into(),
+            None => {}
+        }
+        self.trash.retain(|t| t.0 != id);
+        self.selected = self.meetings.iter().position(|m| m.id == id).unwrap_or(0);
+        self.status = "Restored".into();
+        cx.notify();
+    }
+
+    fn delete_for_good(&mut self, id: i64, cx: &mut Context<Self>) {
         if let Some(store) = &self.store {
             let result = store.delete_meeting(id);
             self.save(result);
         }
         audio::delete_audio(id);
-        self.meetings.remove(self.selected);
-        self.selected = self.selected.min(self.meetings.len().saturating_sub(1));
-        self.confirm_delete = None;
-        self.status = "Meeting deleted".into();
+        self.trash.retain(|t| t.0 != id);
+        self.status = "Deleted for good".into();
         cx.notify();
     }
 
@@ -1280,9 +1317,43 @@ impl Notary {
     fn list(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let terms = search::terms(self.search.text());
         let mut items = div().id("meetings").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().px(px(6.)).pb(px(10.));
+        if self.trash_open {
+            items = items.child(
+                div()
+                    .px(px(8.))
+                    .py(px(10.))
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(rgb(t.faint))
+                    .child(if self.trash.is_empty() { "The trash is empty." } else { "Meetings here are deleted for good after 30 days." }),
+            );
+            for (id, title, started, deleted) in self.trash.clone() {
+                let left = (TRASH_DAYS - (chrono::Local::now().timestamp() - deleted) / 86_400).max(0);
+                let day = chrono::DateTime::from_timestamp(started, 0)
+                    .map(|d| d.with_timezone(&chrono::Local).format("%b %-d").to_string())
+                    .unwrap_or_default();
+                items = items.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .px(px(10.))
+                        .py(px(9.))
+                        .child(div().truncate().text_size(px(13.5)).text_color(rgb(t.ink)).child(title))
+                        .child(div().text_size(px(12.)).text_color(rgb(t.faint)).child(format!("{day} \u{b7} {left} days left")))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.))
+                                .child(Self::pill(format!("restore-{id}").into(), "Restore".into(), true, t).on_click(cx.listener(move |this, _, _, cx| this.restore_from_trash(id, cx))))
+                                .child(Self::pill(format!("purge-{id}").into(), "Delete for good".into(), false, t).on_click(cx.listener(move |this, _, _, cx| this.delete_for_good(id, cx)))),
+                        ),
+                );
+            }
+        }
         let mut last_day = String::new();
         let mut shown = 0;
-        let coming: Vec<native::CalendarEvent> = if terms.is_empty() && self.recording.is_none() {
+        let coming: Vec<native::CalendarEvent> = if terms.is_empty() && self.recording.is_none() && !self.trash_open {
             let shown = self.shown_events();
             calendar::upcoming(&shown, chrono::Local::now().timestamp(), 3).into_iter().cloned().collect()
         } else {
@@ -1314,7 +1385,7 @@ impl Notary {
                 );
             }
         }
-        for (i, m) in self.meetings.iter().enumerate() {
+        for (i, m) in self.meetings.iter().enumerate().filter(|_| !self.trash_open) {
             if self.folder_filter.is_some() && m.folder != self.folder_filter {
                 continue;
             }
@@ -1382,7 +1453,7 @@ impl Notary {
                     .child(div().truncate().text_size(px(12.)).text_color(rgb(t.soft)).child(sub)),
             );
         }
-        if shown == 0 && !terms.is_empty() {
+        if shown == 0 && !terms.is_empty() && !self.trash_open {
             items = items.child(
                 div()
                     .px(px(10.))
@@ -1448,6 +1519,10 @@ impl Notary {
         row = row.child(chip("folder-new".into(), "+ Folder".into(), self.adding_folder).on_click(cx.listener(|this, _, window, cx| {
             this.adding_folder = true;
             window.focus(&this.focus_folder);
+            cx.notify();
+        })));
+        row = row.child(chip("trash-chip".into(), format!("Trash ({})", self.trash.len()).into(), self.trash_open).on_click(cx.listener(|this, _, _, cx| {
+            this.trash_open = !this.trash_open;
             cx.notify();
         })));
         if self.folder_filter.is_some() {
