@@ -104,3 +104,62 @@ pub fn call_watch(app: CallApp) -> Option<(CallWatch, UnboundedReceiver<Reading>
     });
     Some((CallWatch { child, stopped }, rx))
 }
+
+/// Audio playback through the helper. Dropping it stops the sound.
+pub struct Player {
+    child: Arc<std::sync::Mutex<Option<Child>>>,
+}
+
+impl Player {
+    pub fn stop(&self) {
+        if let Some(mut child) = self.child.lock().ok().and_then(|mut c| c.take()) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Plays `files` together from `start` seconds. The receiver gets a message when the sound ends.
+pub fn play(start: f32, files: &[std::path::PathBuf]) -> Option<(Player, futures::channel::oneshot::Receiver<()>)> {
+    let helper = native::helper_path()?;
+    let mut child = Command::new(helper)
+        .arg("play")
+        .arg(format!("{start}"))
+        .args(files)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdin = child.stdin.take();
+    let child = Arc::new(std::sync::Mutex::new(Some(child)));
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let watched = child.clone();
+    std::thread::spawn(move || {
+        let _keep_open = stdin;
+        loop {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut guard = match watched.lock() {
+                Ok(g) => g,
+                Err(_) => break,
+            };
+            match guard.as_mut() {
+                None => break,
+                Some(c) => {
+                    if matches!(c.try_wait(), Ok(Some(_))) {
+                        *guard = None;
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tx.send(());
+    });
+    Some((Player { child }, rx))
+}

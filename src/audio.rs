@@ -105,6 +105,40 @@ pub fn compress(dir: &Path, name: &str) {
     }
 }
 
+/// Converts any audio or video file macOS can read to a 16 kHz mono 16-bit WAV at `out`.
+pub fn convert_to_wav(input: &Path, out: &Path) -> Result<(), String> {
+    let result = Command::new("/usr/bin/afconvert")
+        .args(["-f", "WAVE", "-d", "LEI16@16000", "-c", "1"])
+        .arg(input)
+        .arg(out)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&result.stderr).trim().to_string())
+    }
+}
+
+/// Reads the samples of a 16-bit mono WAV file as floats, finding the data chunk wherever it is.
+pub fn read_wav(path: &Path) -> std::io::Result<Vec<f32>> {
+    let bytes = fs::read(path)?;
+    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "not a 16-bit WAV file");
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" {
+        return Err(bad());
+    }
+    let mut pos = 12;
+    while pos + 8 <= bytes.len() {
+        let size = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]) as usize;
+        if &bytes[pos..pos + 4] == b"data" {
+            let end = (pos + 8 + size).min(bytes.len());
+            return Ok(bytes[pos + 8..end].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect());
+        }
+        pos += 8 + size + (size & 1);
+    }
+    Err(bad())
+}
+
 pub fn delete_audio(id: i64) {
     let _ = fs::remove_dir_all(meeting_dir(id));
 }

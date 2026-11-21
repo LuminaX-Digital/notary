@@ -33,14 +33,22 @@ pub enum Event {
     Listening { mic: bool },
     Segment { source: Source, start: f32, end: f32, text: String },
     Failed(String),
+    /// Share of an imported file that is done, 0 to 1.
+    Progress(f32),
     Stopped,
 }
 
 pub struct Recording {
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 impl Recording {
+    /// While paused, nothing that is heard is kept or transcribed.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -63,13 +71,15 @@ pub fn start(model: PathBuf, config: Config) -> (Recording, UnboundedReceiver<Ev
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = unbounded();
     let flag = stop.clone();
+    let paused = Arc::new(AtomicBool::new(false));
+    let pause_flag = paused.clone();
     std::thread::spawn(move || {
-        if let Err(e) = run(model, config, flag, &tx) {
+        if let Err(e) = run(model, config, flag, pause_flag, &tx) {
             let _ = tx.unbounded_send(Event::Failed(format!("{e:#}")));
         }
         let _ = tx.unbounded_send(Event::Stopped);
     });
-    (Recording { stop }, rx)
+    (Recording { stop, paused }, rx)
 }
 
 struct AudioTap {
@@ -195,7 +205,86 @@ fn base_config() -> SCStreamConfiguration {
         .with_channel_count(1)
 }
 
-fn run(model: PathBuf, speech: Config, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -> Result<()> {
+/// Runs whisper on one chunk and returns (start, end, text) of each phrase, in seconds from the chunk start.
+fn transcribe(state: &mut whisper_rs::WhisperState, speech: &Config, chunk: &[f32]) -> Result<Vec<(f32, f32, String)>> {
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some(&speech.language));
+    if !speech.prompt.is_empty() {
+        params.set_initial_prompt(&speech.prompt);
+    }
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_no_context(true);
+    params.set_suppress_blank(true);
+    state.full(params, chunk)?;
+    let mut out = Vec::new();
+    for segment in state.as_iter() {
+        if segment.no_speech_probability() > NO_SPEECH_MAX {
+            continue;
+        }
+        let text = segment.to_string();
+        let text = text.trim();
+        if !text.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        out.push((segment.start_timestamp() as f32 / 100.0, segment.end_timestamp() as f32 / 100.0, text.to_string()));
+    }
+    Ok(out)
+}
+
+/// Transcribes an audio or video file instead of live sound. Progress arrives as events; Stop cancels.
+pub fn import(model: PathBuf, speech: Config, file: PathBuf) -> (Recording, UnboundedReceiver<Event>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = unbounded();
+    let flag = stop.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = run_import(model, speech, file, flag, &tx) {
+            let _ = tx.unbounded_send(Event::Failed(format!("{e:#}")));
+        }
+        let _ = tx.unbounded_send(Event::Stopped);
+    });
+    (Recording { stop, paused: Arc::new(AtomicBool::new(false)) }, rx)
+}
+
+fn run_import(model: PathBuf, speech: Config, file: PathBuf, stop: Arc<AtomicBool>, events: &UnboundedSender<Event>) -> Result<()> {
+    let _ = events.unbounded_send(Event::Loading);
+    let dir = speech.audio_dir.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("notary-import-{}", std::process::id())));
+    std::fs::create_dir_all(&dir)?;
+    let wav = dir.join("them.wav");
+    audio::convert_to_wav(&file, &wav).map_err(|e| anyhow::anyhow!("macOS could not read this file: {e}"))?;
+    let samples = audio::read_wav(&wav)?;
+    let ctx = WhisperContext::new_with_params(
+        model.to_str().context("model path is not valid UTF-8")?,
+        WhisperContextParameters::default(),
+    )
+    .context("could not load the whisper model")?;
+    let mut state = ctx.create_state()?;
+    let total = samples.len().max(1) as f32;
+    let mut lane = Lane::new(Source::System);
+    lane.buf = samples;
+    let mut done = 0usize;
+    while !stop.load(Ordering::Relaxed) {
+        let before = lane.buf.len();
+        let Some((start, chunk)) = lane.next_chunk(true) else { break };
+        done += before - lane.buf.len();
+        if rms(&chunk) >= SILENCE_RMS {
+            for (from, to, text) in transcribe(&mut state, &speech, &chunk)? {
+                let _ = events.unbounded_send(Event::Segment { source: Source::System, start: start + from, end: start + to.max(from), text });
+            }
+        }
+        let _ = events.unbounded_send(Event::Progress(done as f32 / total));
+    }
+    if speech.audio_dir.is_some() {
+        audio::compress(&dir, "them");
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(())
+}
+
+fn run(model: PathBuf, speech: Config, stop: Arc<AtomicBool>, paused: Arc<AtomicBool>, events: &UnboundedSender<Event>) -> Result<()> {
     let _ = events.unbounded_send(Event::Loading);
     let ctx = WhisperContext::new_with_params(
         model.to_str().context("model path is not valid UTF-8")?,
@@ -239,6 +328,7 @@ fn run(model: PathBuf, speech: Config, stop: Arc<AtomicBool>, events: &Unbounded
     loop {
         if !stopping {
             match audio_rx.recv_timeout(Duration::from_millis(150)) {
+                Ok(_) if paused.load(Ordering::Relaxed) => {}
                 Ok((source, samples)) => {
                     if let Some(w) = wavs[source as usize].as_mut() {
                         let _ = w.write(&samples);
@@ -267,29 +357,10 @@ fn run(model: PathBuf, speech: Config, stop: Arc<AtomicBool>, events: &Unbounded
                 if rms(&chunk) < SILENCE_RMS {
                     continue;
                 }
-                let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-                params.set_language(Some(&speech.language));
-                if !speech.prompt.is_empty() {
-                    params.set_initial_prompt(&speech.prompt);
-                }
-                params.set_print_special(false);
-                params.set_print_progress(false);
-                params.set_print_realtime(false);
-                params.set_print_timestamps(false);
-                params.set_no_context(true);
-                params.set_suppress_blank(true);
-                state.full(params, &chunk)?;
-                for segment in state.as_iter() {
-                    if segment.no_speech_probability() > NO_SPEECH_MAX {
-                        continue;
-                    }
-                    let text = segment.to_string();
-                    let text = text.trim();
-                    if !text.chars().any(char::is_alphanumeric) {
-                        continue;
-                    }
-                    let at = start + segment.start_timestamp() as f32 / 100.0;
-                    let until = start + segment.end_timestamp() as f32 / 100.0;
+                for (from, to, text) in transcribe(&mut state, &speech, &chunk)? {
+                    let text = text.as_str();
+                    let at = start + from;
+                    let until = start + to;
                     match lane.source {
                         Source::System => system_lines.push((at, words(text))),
                         Source::Mic if is_echo(text, at, &system_lines) => continue,

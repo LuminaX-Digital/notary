@@ -464,6 +464,32 @@ func callTitles(_ bundles: [String]) {
     emit(out)
 }
 
+// MARK: - play
+
+/// Plays audio files together from `start` seconds; ends when they finish or when stdin closes.
+func play(_ args: [String]) {
+    guard args.count >= 2, let start = Double(args[0]) else { fail("usage", exitCode: 2) }
+    var players: [AVAudioPlayer] = []
+    for file in args.dropFirst() {
+        if let p = try? AVAudioPlayer(contentsOf: URL(fileURLWithPath: file)), start < p.duration {
+            p.currentTime = start
+            p.prepareToPlay()
+            players.append(p)
+        }
+    }
+    if players.isEmpty { exit(0) }
+    Thread.detachNewThread {
+        while true { if FileHandle.standardInput.availableData.isEmpty { exit(0) } }
+    }
+    let at = players[0].deviceCurrentTime + 0.15
+    for p in players { p.play(atTime: at) }
+    let began = Date()
+    while Date().timeIntervalSince(began) < 0.6 || players.contains(where: { $0.isPlaying }) {
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+    exit(0)
+}
+
 // MARK: - ax-dump
 
 func axDump(_ args: [String]) {
@@ -500,6 +526,7 @@ case "mic-apps": listMicApps()
 case "running-apps": listRunningApps()
 case "call-watch": callWatch(rest)
 case "call-titles": callTitles(rest)
+case "play": play(rest)
 case "ax-dump": axDump(rest)
 default: fail("unknown-command", exitCode: 2)
 }

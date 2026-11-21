@@ -148,6 +148,15 @@ struct Notary {
     event_people: Vec<String>,
     trash_open: bool,
     trash: Vec<(i64, String, i64, i64)>,
+    find_open: bool,
+    find_input: TextInput,
+    focus_find: FocusHandle,
+    instruction_input: TextInput,
+    focus_instruction: FocusHandle,
+    player: Option<(i64, watch::Player)>,
+    play_gen: u64,
+    paused_at: Option<std::time::Instant>,
+    importing: bool,
 }
 
 fn clock(secs: f32) -> String {
@@ -234,6 +243,15 @@ impl Notary {
             event_people: Vec::new(),
             trash_open: false,
             trash,
+            find_open: false,
+            find_input: TextInput::default(),
+            focus_find: cx.focus_handle(),
+            instruction_input: TextInput::default(),
+            focus_instruction: cx.focus_handle(),
+            player: None,
+            play_gen: 0,
+            paused_at: None,
+            importing: false,
         }
     }
 
@@ -505,6 +523,7 @@ impl Notary {
             Event::Segment { source, start, end, text } => {
                 self.last_speech = std::time::Instant::now();
                 let (name, who) = match source {
+                    Source::System if self.importing => ("Audio".to_string(), Speaker::Other),
                     Source::System => {
                         let named = self.timeline.as_ref().and_then(|t| {
                             let mut mine = vec![self.settings.your_name.clone()];
@@ -525,9 +544,13 @@ impl Notary {
                 }
                 self.scroll.scroll_to_bottom();
             }
+            Event::Progress(share) => {
+                self.status = format!("Transcribing the file: {}%", (share * 100.0).round() as u32).into();
+            }
             Event::Failed(message) => {
                 self.recording = None;
                 self.stopping = false;
+                self.importing = false;
                 self.status = message.into();
             }
             Event::Stopped => {
@@ -537,6 +560,8 @@ impl Notary {
                 self.timeline = None;
                 self.call_bound = None;
                 self.ask_stop = false;
+                self.paused_at = None;
+                self.importing = false;
                 if let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) {
                     m.live = false;
                 }
@@ -691,7 +716,12 @@ impl Notary {
             return;
         };
         m.summarizing = true;
-        let transcript = m.transcript_text();
+        let mut transcript = m.transcript_text();
+        let instruction = self.instruction_input.text().trim().to_string();
+        if !instruction.is_empty() {
+            transcript = format!("Instruction from the user for these notes: {instruction}\n\n{transcript}");
+            self.instruction_input.clear();
+        }
         self.status = "Writing the summary on this Mac".into();
         let rx = summarizer::summarize(model, transcript, self.settings.forced_summary_language().map(str::to_string));
         cx.spawn(async move |this, cx| {
@@ -1177,6 +1207,159 @@ impl Notary {
                 if let Some(result) = saved {
                     self.save(result);
                 }
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_find_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        match Self::key_into(&mut self.find_input, ev, cx) {
+            Outcome::Nothing => return,
+            Outcome::Escape => {
+                self.find_input.clear();
+                self.find_open = false;
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn on_instruction_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        match Self::key_into(&mut self.instruction_input, ev, cx) {
+            Outcome::Nothing => return,
+            Outcome::Submit => {
+                if let Some(id) = self.meetings.get(self.selected).map(|m| m.id) {
+                    return self.start_summary(id, cx);
+                }
+            }
+            Outcome::Escape => self.instruction_input.clear(),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Plays the saved audio of a meeting from `start` seconds, or stops it when it is already playing.
+    fn toggle_play(&mut self, id: i64, start: f32, cx: &mut Context<Self>) {
+        if self.player.as_ref().is_some_and(|p| p.0 == id) && start == 0.0 {
+            self.player = None;
+            cx.notify();
+            return;
+        }
+        self.player = None;
+        let dir = audio::meeting_dir(id);
+        let files: Vec<std::path::PathBuf> = ["them.m4a", "me.m4a"].iter().map(|n| dir.join(n)).filter(|p| p.exists()).collect();
+        if files.is_empty() {
+            return;
+        }
+        match watch::play(start, &files) {
+            Some((player, ended)) => {
+                self.play_gen += 1;
+                let generation = self.play_gen;
+                self.player = Some((id, player));
+                cx.spawn(async move |this, cx| {
+                    let _ = ended.await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.play_gen == generation {
+                            this.player = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+            None => self.status = "Playback needs the notary-mac helper next to the app".into(),
+        }
+        cx.notify();
+    }
+
+    /// Asks for an audio or video file and turns its speech into a new meeting.
+    fn import_audio(&mut self, cx: &mut Context<Self>) {
+        if self.recording.is_some() {
+            return;
+        }
+        let Some(model) = engine::model_path() else {
+            self.setup_open = true;
+            self.status = "Download the speech model first".into();
+            cx.notify();
+            return;
+        };
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Transcribe".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else { return };
+            let Some(file) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |this, cx| this.start_import(model, file, cx));
+        })
+        .detach();
+    }
+
+    fn start_import(&mut self, model: std::path::PathBuf, file: std::path::PathBuf, cx: &mut Context<Self>) {
+        if self.recording.is_some() {
+            return;
+        }
+        let started = chrono::Local::now().timestamp();
+        let title = file.file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_TITLE.to_string());
+        let id = match &self.store {
+            Some(store) => match store.create_meeting(&title, started) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.status = format!("Could not save: {e:#}").into();
+                    cx.notify();
+                    return;
+                }
+            },
+            None => self.meetings.iter().map(|m| m.id).max().unwrap_or(0) + 1,
+        };
+        self.meetings.insert(0, Meeting::new(id, &title, started, true, Vec::new()));
+        self.selected = 0;
+        self.trash_open = false;
+        self.importing = true;
+        let (rec, mut events) = engine::import(
+            model,
+            engine::Config {
+                language: self.settings.whisper_language().to_string(),
+                prompt: self.settings.prompt_words(),
+                audio_dir: self.settings.keep_audio.then(|| audio::meeting_dir(id)),
+            },
+            file,
+        );
+        self.recording = Some(rec);
+        self.status = "Reading the file".into();
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next().await {
+                if this.update(cx, |this, cx| this.apply(id, event, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+        let Some(rec) = &self.recording else { return };
+        if self.stopping {
+            return;
+        }
+        match self.paused_at.take() {
+            None => {
+                rec.set_paused(true);
+                self.paused_at = Some(std::time::Instant::now());
+                self.status = "Paused. Nothing is recorded until you resume.".into();
+            }
+            Some(since) => {
+                rec.set_paused(false);
+                // The call window kept moving while the audio stood still: shift the timeline by the pause.
+                self.rec_started_ms += since.elapsed().as_millis() as i64;
+                if let Some(t) = self.timeline.as_mut() {
+                    t.set_zero(self.rec_started_ms);
+                }
+                self.last_speech = std::time::Instant::now();
+                self.status = "Listening".into();
             }
         }
         cx.notify();
@@ -2229,7 +2412,18 @@ impl Notary {
             .flex_col()
             .px(px(24.))
             .py(px(8.));
-        for l in &m.lines {
+        let find_terms = if self.find_open { search::terms(self.find_input.text()) } else { Vec::new() };
+        let mut found = 0;
+        let has_audio = audio::has_audio(m.id);
+        let live_id = m.id;
+        for (line_index, l) in m.lines.iter().enumerate() {
+            if !find_terms.is_empty() {
+                let hay = format!("{} {}", l.name, l.text).to_lowercase();
+                if !find_terms.iter().all(|w| hay.contains(w.as_str())) {
+                    continue;
+                }
+                found += 1;
+            }
             let (who_color, note) = match l.who {
                 Speaker::Me => (t.accent, false),
                 Speaker::Other => (t.ink, false),
@@ -2260,13 +2454,20 @@ impl Notary {
                     .border_color(rgb(t.line))
                     .child(
                         div()
+                            .id(("ts", line_index))
                             .w(px(50.))
                             .flex_none()
                             .pt(px(3.))
                             .font_family(MONO)
                             .text_size(px(11.))
                             .text_color(rgb(t.faint))
-                            .child(l.ts.clone()),
+                            .child(l.ts.clone())
+                            .when(has_audio && !m.live && l.who != Speaker::Note, |d| {
+                                let secs = l.ts.split(':').fold(0.0f32, |acc, p| acc * 60.0 + p.parse::<f32>().unwrap_or(0.0));
+                                d.cursor_pointer()
+                                    .hover(|h| h.text_color(rgb(t.accent)))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_play(live_id, secs.max(0.001), cx)))
+                            }),
                     )
                     .child(
                         div()
@@ -2322,6 +2523,27 @@ impl Notary {
                 .child(div().flex_1())
                 .when(can_summarize, |d| d.child(summarize_button)),
         );
+        if can_summarize {
+            let instr_focused = self.focus_instruction.is_focused(window);
+            summary = summary.child(
+                div()
+                    .id("instruction-input")
+                    .track_focus(&self.focus_instruction)
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_instruction_key(ev, cx)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.focus_instruction);
+                        cx.notify();
+                    }))
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(px(8.))
+                    .bg(rgb(t.rail))
+                    .border_1()
+                    .border_color(rgb(if instr_focused { t.focus } else { t.rail }))
+                    .overflow_hidden()
+                    .child(field_text(&self.instruction_input, "Optional: what to focus on, then Enter", 36, 12.5, instr_focused, t)),
+            );
+        }
         if m.summarizing || m.summary.is_empty() {
             let placeholder = if m.summarizing {
                 "Writing the summary on this Mac. This takes a few seconds."
@@ -2449,6 +2671,68 @@ impl Notary {
                 .overflow_hidden()
                 .child(field_text(&self.note_input, "Write your own note and press Enter", 70, 13., note_focused, t)),
         );
+        let playing = self.player.as_ref().is_some_and(|p| p.0 == m.id);
+        let find_focused = self.focus_find.is_focused(window);
+        let tool = |id: &'static str, label: &'static str, active: bool| {
+            div()
+                .id(id)
+                .flex_none()
+                .px(px(10.))
+                .py(px(4.))
+                .rounded_full()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .when(active, |d| d.bg(rgb(t.accent_soft)).text_color(rgb(t.accent)))
+                .when(!active, |d| d.bg(rgb(t.rail)).text_color(rgb(t.soft)).hover(|h| h.text_color(rgb(t.accent))))
+                .child(label)
+        };
+        let tools = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(24.))
+            .py(px(8.))
+            .border_b_1()
+            .border_color(rgb(t.line))
+            .when(has_audio && !m.live, |d| {
+                d.child(
+                    tool("play", if playing { "Stop" } else { "Play" }, playing)
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_play(meeting_id, 0.0, cx))),
+                )
+            })
+            .child(tool("find", "Find", self.find_open).on_click(cx.listener(|this, _, window, cx| {
+                this.find_open = !this.find_open;
+                if this.find_open {
+                    window.focus(&this.focus_find);
+                } else {
+                    this.find_input.clear();
+                }
+                cx.notify();
+            })))
+            .when(self.find_open, |d| {
+                d.child(
+                    div()
+                        .id("find-input")
+                        .track_focus(&self.focus_find)
+                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_find_key(ev, cx)))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            window.focus(&this.focus_find);
+                            cx.notify();
+                        }))
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(10.))
+                        .py(px(4.))
+                        .rounded(px(8.))
+                        .bg(rgb(t.rail))
+                        .border_1()
+                        .border_color(rgb(if find_focused { t.focus } else { t.rail }))
+                        .overflow_hidden()
+                        .child(field_text(&self.find_input, "Find in this transcript", 40, 13., find_focused, t)),
+                )
+                .child(div().flex_none().text_size(px(12.)).text_color(rgb(t.faint)).child(format!("{found} found")))
+            });
         let confirming = self.confirm_delete == Some(m.id);
         let head = div()
             .flex()
@@ -2605,7 +2889,7 @@ impl Notary {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(div().flex_1().min_w_0().h_full().flex().flex_col().child(transcript).child(note_bar))
+                    .child(div().flex_1().min_w_0().h_full().flex().flex_col().child(tools).child(transcript).child(note_bar))
                     .child(side),
             )
             .into_any_element()
@@ -2714,6 +2998,40 @@ impl Notary {
             .border_t_1()
             .border_color(rgb(t.line))
             .child(record_button)
+            .when(!recording, |d| {
+                d.child(
+                    div()
+                        .id("import")
+                        .px(px(12.))
+                        .py(px(6.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .bg(rgb(t.rail))
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(t.soft))
+                        .hover(|h| h.text_color(rgb(t.ink)))
+                        .on_click(cx.listener(|this, _, _, cx| this.import_audio(cx)))
+                        .child("Import audio"),
+                )
+            })
+            .when(recording && !self.importing && !self.stopping, |d| {
+                d.child(
+                    div()
+                        .id("pause")
+                        .px(px(12.))
+                        .py(px(6.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .bg(rgb(t.rail))
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(t.soft))
+                        .hover(|h| h.text_color(rgb(t.ink)))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx)))
+                        .child(if self.paused_at.is_some() { "Resume" } else { "Pause" }),
+                )
+            })
             .child(
                 div()
                     .flex_1()
