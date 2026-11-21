@@ -1009,6 +1009,44 @@ impl Notary {
         cx.notify();
     }
 
+    /// Saves a ZIP with the database, the settings and the audio of every meeting.
+    fn back_up(&mut self, cx: &mut Context<Self>) {
+        if let Some(store) = &self.store {
+            let result = store.checkpoint();
+            self.save(result);
+        }
+        let day = chrono::Local::now().format("%Y-%m-%d");
+        let name = format!("Notary backup {day}.zip");
+        let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Documents");
+        let rx = cx.prompt_for_new_path(&dir, Some(&name));
+        let source = settings::data_dir();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(target))) = rx.await else { return };
+            let job = native::in_background(move || {
+                let _ = std::fs::remove_file(&target);
+                let out = std::process::Command::new("/usr/bin/ditto")
+                    .args(["-c", "-k", "--keepParent"])
+                    .arg(&source)
+                    .arg(&target)
+                    .output()?;
+                if !out.status.success() {
+                    anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+                }
+                Ok(target)
+            });
+            let message = match job.await {
+                Ok(Ok(path)) => format!("Backup saved to {}", path.display()),
+                Ok(Err(e)) => format!("Backup failed: {e:#}"),
+                Err(_) => "Backup was interrupted".to_string(),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.status = message.into();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn persist_settings(&mut self) {
         if let Err(e) = self.settings.save() {
             self.status = format!("Could not save settings: {e:#}").into();
@@ -1867,7 +1905,26 @@ impl Notary {
             .child(perm_row("Microphone", "Picks up your own voice.", p.map(|p| p.microphone == "authorized"), "microphone", cx))
             .child(perm_row("Accessibility", "Reads who is speaking from the Zoom, Teams or Meet window. Nothing else is read.", p.map(|p| p.accessibility), "accessibility", cx))
             .child(perm_row("Calendar", "Shows your next meetings and names recordings after them.", p.map(|p| p.calendar == "fullAccess"), "calendar", cx));
-        div().flex().flex_col().gap(px(16.)).child(you).child(recording).child(language).child(permissions)
+        let data = Self::settings_card(t)
+            .child(div().font_family(SERIF).text_size(px(16.)).text_color(rgb(t.ink)).child("Your data"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(16.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(label("Back up everything"))
+                            .child(hint("Saves a ZIP with your meetings, settings and audio. To restore it, quit Notary and unzip it over the Notary folder in Application Support.")),
+                    )
+                    .child(Self::pill("backup".into(), "Back up\u{2026}".into(), true, t).on_click(cx.listener(|this, _, _, cx| this.back_up(cx)))),
+            );
+        div().flex().flex_col().gap(px(16.)).child(you).child(recording).child(language).child(permissions).child(data)
     }
 
     fn model_row(&self, kind: Kind, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {

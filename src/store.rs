@@ -118,6 +118,12 @@ impl Store {
         Ok(ids)
     }
 
+    /// Writes everything still in the write-ahead log into the main database file, so a copy of the file is whole.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(())
+    }
+
     pub fn set_people(&self, meeting_id: i64, people: &[String]) -> Result<()> {
         self.conn.execute("UPDATE meetings SET people = ?2 WHERE id = ?1", params![meeting_id, people.join("\n")])?;
         Ok(())
