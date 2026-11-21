@@ -234,6 +234,16 @@ impl Timeline {
         self.samples.push(sample);
     }
 
+    /// The recording really started now: the audio's zero point.
+    pub fn set_zero(&mut self, ms: i64) {
+        self.zero_ms = ms;
+    }
+
+    /// The user's own name as the call window shows it, when the window marks it.
+    pub fn me(&self) -> Option<String> {
+        self.samples.iter().rev().find_map(|s| s.me.clone())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }

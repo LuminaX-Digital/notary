@@ -52,6 +52,8 @@ pub struct Meeting {
     pub started: i64,
     pub live: bool,
     pub summarizing: bool,
+    /// People seen in the call window or on the calendar invite.
+    pub people: Vec<String>,
     pub lines: Vec<Line>,
     pub summary: Vec<(SharedString, SharedString)>,
     pub actions: Vec<Action>,
@@ -79,6 +81,7 @@ impl Meeting {
             started,
             live,
             summarizing: false,
+            people: Vec::new(),
             lines,
             summary: Vec::new(),
             actions: Vec::new(),

@@ -143,3 +143,17 @@ mod tests {
         assert_eq!(apps[0].bundle_id, "us.zoom.CptHost");
     }
 }
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct CallTitles {
+    #[serde(rename = "bundleId")]
+    pub bundle_id: String,
+    pub titles: Vec<String>,
+}
+
+/// Windows that look like a call in the given apps. Needs the Accessibility permission; empty without it.
+pub fn call_titles(bundles: &[&str]) -> Result<Vec<CallTitles>> {
+    let mut args = vec!["call-titles"];
+    args.extend_from_slice(bundles);
+    run(&args)
+}

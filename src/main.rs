@@ -16,6 +16,7 @@ mod store;
 mod summarizer;
 mod theme;
 mod updates;
+mod watch;
 
 use data::{Action, Folder, Meeting, Speaker, line};
 use engine::{Event, Recording, Source};
@@ -129,6 +130,16 @@ struct Notary {
     confirm_delete: Option<i64>,
     status: SharedString,
     scroll: ScrollHandle,
+    detector: calls::Detector,
+    pending_bound: Option<calls::CallApp>,
+    call_bound: Option<calls::CallApp>,
+    rec_started_ms: i64,
+    timeline: Option<callnames::Timeline>,
+    call_watch: Option<watch::CallWatch>,
+    last_speech: std::time::Instant,
+    offer: Option<calls::CallApp>,
+    ask_stop: bool,
+    warned_accessibility: bool,
 }
 
 fn clock(secs: f32) -> String {
@@ -152,6 +163,7 @@ impl Notary {
         name_input.set(&settings.your_name);
         let mut words_input = TextInput::default();
         words_input.set(&settings.custom_words);
+        Self::watch_microphone(cx);
         Self {
             settings,
             name_input,
@@ -189,6 +201,105 @@ impl Notary {
             confirm_delete: None,
             status,
             scroll: ScrollHandle::new(),
+            detector: calls::Detector::default(),
+            pending_bound: None,
+            call_bound: None,
+            rec_started_ms: 0,
+            timeline: None,
+            call_watch: None,
+            last_speech: std::time::Instant::now(),
+            offer: None,
+            ask_stop: false,
+            warned_accessibility: false,
+        }
+    }
+
+    /// Looks every few seconds at which call apps use the microphone.
+    fn watch_microphone(cx: &mut Context<Self>) {
+        let mut apps = watch::mic_poll();
+        cx.spawn(async move |this, cx| {
+            while let Some(on_mic) = apps.next().await {
+                if this.update(cx, |this, cx| this.on_mic(on_mic, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn on_mic(&mut self, on_mic: Vec<calls::CallApp>, cx: &mut Context<Self>) {
+        let rec = self.recording.as_ref().map(|_| calls::Recording { started_ms: self.rec_started_ms, bound: self.call_bound });
+        let poll = calls::Poll {
+            now_ms: chrono::Local::now().timestamp_millis(),
+            on_mic: &on_mic,
+            recording: rec.as_ref(),
+            quiet_secs: self.last_speech.elapsed().as_secs(),
+        };
+        let rules = calls::Rules { offer_to_record: self.settings.offer_to_record, stop_when_call_ends: self.settings.stop_when_call_ends };
+        for action in self.detector.step(&poll, &rules) {
+            match action {
+                calls::Action::Offer(app) => self.offer = Some(app),
+                calls::Action::Bind(app) => {
+                    self.call_bound = Some(app);
+                    if let Some(id) = self.meetings.first().filter(|m| m.live).map(|m| m.id) {
+                        self.begin_call_watch(app, id, cx);
+                    }
+                }
+                calls::Action::AutoStop => {
+                    if self.recording.is_some() && !self.stopping {
+                        self.status = "The call ended".into();
+                        self.toggle_recording(cx);
+                    }
+                }
+                calls::Action::AskStop => self.ask_stop = true,
+            }
+        }
+        cx.notify();
+    }
+
+    /// Starts reading who speaks from the window of the call app.
+    fn begin_call_watch(&mut self, app: calls::CallApp, id: i64, cx: &mut Context<Self>) {
+        let zero = self.rec_started_ms;
+        self.timeline.get_or_insert_with(|| callnames::Timeline::new(zero));
+        let Some((watcher, mut readings)) = watch::call_watch(app) else { return };
+        self.call_watch = Some(watcher);
+        cx.spawn(async move |this, cx| {
+            while let Some(reading) = readings.next().await {
+                if this.update(cx, |this, cx| this.on_reading(id, app, reading, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn on_reading(&mut self, id: i64, app: calls::CallApp, reading: callnames::Reading, cx: &mut Context<Self>) {
+        if self.recording.is_none() {
+            return;
+        }
+        if reading.error.as_deref() == Some("not-trusted") {
+            if !self.warned_accessibility {
+                self.warned_accessibility = true;
+                self.status = "Speaker names need the Accessibility permission for Notary".into();
+                cx.notify();
+            }
+            return;
+        }
+        let sample = callnames::read(app, &reading);
+        let Some(timeline) = self.timeline.as_mut() else { return };
+        let before = timeline.seen.len();
+        timeline.push(sample);
+        if timeline.seen.len() != before {
+            let mine = self.settings.your_name.clone();
+            let people: Vec<String> = timeline.seen.iter().filter(|p| **p != mine).cloned().collect();
+            if let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) {
+                m.people = people.clone();
+            }
+            if let Some(store) = &self.store {
+                let result = store.set_people(id, &people);
+                self.save(result);
+            }
+            cx.notify();
         }
     }
 
@@ -241,6 +352,18 @@ impl Notary {
         );
         self.recording = Some(rec);
         self.status = "Loading the model".into();
+        self.rec_started_ms = chrono::Local::now().timestamp_millis();
+        self.detector.recording_started();
+        self.last_speech = std::time::Instant::now();
+        self.offer = None;
+        self.ask_stop = false;
+        self.timeline = None;
+        self.call_watch = None;
+        self.warned_accessibility = false;
+        self.call_bound = self.pending_bound.take();
+        if let Some(app) = self.call_bound {
+            self.begin_call_watch(app, id, cx);
+        }
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
@@ -258,15 +381,28 @@ impl Notary {
         match event {
             Event::Loading => self.status = "Loading the model".into(),
             Event::Listening { mic } => {
+                let now = chrono::Local::now().timestamp_millis();
+                self.rec_started_ms = now;
+                if let Some(t) = self.timeline.as_mut() {
+                    t.set_zero(now);
+                }
                 self.status = if mic {
                     "Listening to your Mac's audio and your microphone".into()
                 } else {
                     "Listening to your Mac's audio (microphone needs macOS 15)".into()
                 };
             }
-            Event::Segment { source, start, text } => {
+            Event::Segment { source, start, end, text } => {
+                self.last_speech = std::time::Instant::now();
                 let (name, who) = match source {
-                    Source::System => ("Call audio".to_string(), Speaker::Other),
+                    Source::System => {
+                        let named = self.timeline.as_ref().and_then(|t| {
+                            let mut mine = vec![self.settings.your_name.clone()];
+                            mine.extend(t.me());
+                            t.who((start * 1000.0) as i64, (end * 1000.0) as i64, &mine)
+                        });
+                        (named.unwrap_or_else(|| "Call audio".to_string()), Speaker::Other)
+                    }
                     Source::Mic => (self.settings.your_name.clone(), Speaker::Me),
                 };
                 let l = line(&clock(start), &name, who, &text);
@@ -287,6 +423,10 @@ impl Notary {
             Event::Stopped => {
                 self.recording = None;
                 self.stopping = false;
+                self.call_watch = None;
+                self.timeline = None;
+                self.call_bound = None;
+                self.ask_stop = false;
                 if let Some(m) = self.meetings.iter_mut().find(|m| m.id == id) {
                     m.live = false;
                 }
@@ -2014,6 +2154,9 @@ impl Notary {
                             .text_color(rgb(t.faint))
                             .child(m.meta()),
                     )
+                    .when(!m.people.is_empty(), |d| {
+                        d.child(div().text_size(px(12.)).text_color(rgb(t.soft)).child(format!("With {}", m.people.join(", "))))
+                    })
                     .when(self.moving, |d| {
                         let mut chips = div().flex().flex_wrap().gap(px(6.)).pt(px(4.));
                         let pick = |id: SharedString, label: SharedString, active: bool| {
@@ -2127,6 +2270,70 @@ impl Notary {
             .into_any_element()
     }
 
+    /// Cards above the footbar: an offer to record a call, or a question about stopping.
+    fn cards(&self, t: &Theme, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px(px(12.))
+                .py(px(5.))
+                .rounded_full()
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(primary, |b| b.bg(rgb(t.accent)).text_color(rgb(t.paper)))
+                .when(!primary, |b| b.bg(rgb(t.rail)).text_color(rgb(t.soft)).hover(|h| h.text_color(rgb(t.ink))))
+                .child(label)
+        };
+        let card = |text: String| {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px(px(16.))
+                .py(px(10.))
+                .bg(rgb(t.accent_soft))
+                .border_t_1()
+                .border_color(rgb(t.line))
+                .text_size(px(13.))
+                .text_color(rgb(t.ink))
+                .child(div().flex_1().min_w_0().child(text))
+        };
+        let mut out = Vec::new();
+        if let (Some(app), None) = (self.offer, &self.recording) {
+            out.push(
+                card(format!("{} is using your microphone. Record this call?", app.name()))
+                    .child(button("offer-yes", "Record", true).on_click(cx.listener(move |this, _, _, cx| {
+                        this.offer = None;
+                        this.pending_bound = Some(app);
+                        this.toggle_recording(cx);
+                    })))
+                    .child(button("offer-no", "Not now", false).on_click(cx.listener(|this, _, _, cx| {
+                        this.offer = None;
+                        cx.notify();
+                    })))
+                    .into_any_element(),
+            );
+        }
+        if self.ask_stop && self.recording.is_some() && !self.stopping {
+            out.push(
+                card("Nothing has been said for a minute. Stop recording?".to_string())
+                    .child(button("stop-yes", "Stop", true).on_click(cx.listener(|this, _, _, cx| {
+                        this.ask_stop = false;
+                        this.toggle_recording(cx);
+                    })))
+                    .child(button("stop-no", "Keep going", false).on_click(cx.listener(|this, _, _, cx| {
+                        this.ask_stop = false;
+                        this.detector.snooze(chrono::Local::now().timestamp_millis());
+                        cx.notify();
+                    })))
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
     fn footbar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let recording = self.recording.is_some();
         let label = match (recording, self.stopping) {
@@ -2195,6 +2402,7 @@ impl Notary {
             .flex()
             .flex_col()
             .child(body)
+            .children(self.cards(t, cx))
             .child(self.footbar(t, cx))
     }
 }

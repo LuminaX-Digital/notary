@@ -448,6 +448,22 @@ func callWatch(_ args: [String]) {
     exit(0)
 }
 
+// MARK: - call-titles
+
+/// Titles of the windows that look like a call, per app, for the bundles given. Browsers only count with a call tab.
+func callTitles(_ bundles: [String]) {
+    var out: [[String: Any]] = []
+    if AXIsProcessTrusted() {
+        for bundle in bundles {
+            guard let (element, _) = appElement(bundle) else { continue }
+            let fam = family(of: bundle)
+            let titles = windows(of: element).filter { isCallWindow($0, family: fam) }.map { axString($0, kAXTitleAttribute as String) }
+            if !titles.isEmpty { out.append(["bundleId": bundle, "titles": titles]) }
+        }
+    }
+    emit(out)
+}
+
 // MARK: - ax-dump
 
 func axDump(_ args: [String]) {
@@ -483,6 +499,7 @@ case "events": listEvents(rest)
 case "mic-apps": listMicApps()
 case "running-apps": listRunningApps()
 case "call-watch": callWatch(rest)
+case "call-titles": callTitles(rest)
 case "ax-dump": axDump(rest)
 default: fail("unknown-command", exitCode: 2)
 }

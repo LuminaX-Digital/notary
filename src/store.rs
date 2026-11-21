@@ -72,19 +72,29 @@ impl Store {
         if has_folder_column == 0 {
             conn.execute_batch("ALTER TABLE meetings ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL;")?;
         }
+        let has_people: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name = 'people'", [], |r| r.get(0))?;
+        if has_people == 0 {
+            conn.execute_batch("ALTER TABLE meetings ADD COLUMN people TEXT NOT NULL DEFAULT '';")?;
+        }
         Ok(Self { conn })
+    }
+
+    pub fn set_people(&self, meeting_id: i64, people: &[String]) -> Result<()> {
+        self.conn.execute("UPDATE meetings SET people = ?2 WHERE id = ?1", params![meeting_id, people.join("\n")])?;
+        Ok(())
     }
 
     pub fn load_meetings(&self) -> Result<Vec<Meeting>> {
         let mut meetings = Vec::new();
         let mut stmt = self
             .conn
-            .prepare("SELECT id, title, started, folder_id FROM meetings ORDER BY started DESC")?;
+            .prepare("SELECT id, title, started, folder_id, people FROM meetings ORDER BY started DESC")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<i64>>(3)?))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, String>(4)?))
         })?;
         for row in rows {
-            let (id, title, started, folder) = row?;
+            let (id, title, started, folder, people) = row?;
             let mut lines = Vec::new();
             let mut ls = self
                 .conn
@@ -98,6 +108,7 @@ impl Store {
             }
             let mut meeting = Meeting::new(id, &title, started, false, lines);
             meeting.folder = folder;
+            meeting.people = people.lines().filter(|p| !p.is_empty()).map(str::to_string).collect();
 
             let mut ss = self
                 .conn

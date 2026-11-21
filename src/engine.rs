@@ -31,7 +31,7 @@ pub enum Source {
 pub enum Event {
     Loading,
     Listening { mic: bool },
-    Segment { source: Source, start: f32, text: String },
+    Segment { source: Source, start: f32, end: f32, text: String },
     Failed(String),
     Stopped,
 }
@@ -289,6 +289,7 @@ fn run(model: PathBuf, speech: Config, stop: Arc<AtomicBool>, events: &Unbounded
                         continue;
                     }
                     let at = start + segment.start_timestamp() as f32 / 100.0;
+                    let until = start + segment.end_timestamp() as f32 / 100.0;
                     match lane.source {
                         Source::System => system_lines.push((at, words(text))),
                         Source::Mic if is_echo(text, at, &system_lines) => continue,
@@ -297,6 +298,7 @@ fn run(model: PathBuf, speech: Config, stop: Arc<AtomicBool>, events: &Unbounded
                     let _ = events.unbounded_send(Event::Segment {
                         source: lane.source,
                         start: at,
+                        end: until.max(at),
                         text: text.to_string(),
                     });
                 }

@@ -15,6 +15,9 @@ fn bullets(body: &str) -> String {
 /// Title, date, summary, decisions and next steps.
 pub fn notes_markdown(m: &Meeting) -> String {
     let mut out = format!("# {}\n\n*{}*\n", m.title, m.meta().split(" \u{b7} audio").next().unwrap_or(""));
+    if !m.people.is_empty() {
+        out.push_str(&format!("\nWith: {}\n", m.people.join(", ")));
+    }
     for (title, body) in &m.summary {
         out.push_str(&format!("\n## {}\n\n{}\n", title, bullets(body)));
     }
@@ -93,6 +96,7 @@ mod tests {
             ("Summary".into(), "Ship a small first release.".into()),
             ("Decisions".into(), "\u{2022} Mac only\n\u{2022} Cut MCP if late".into()),
         ];
+        m.people = vec!["Lena".into(), "Max".into()];
         m.actions = vec![
             Action { id: 1, label: "Send the DMG".into(), owner: "Fabian".into(), done: true },
             Action { id: 2, label: "Write the README".into(), owner: "Lena".into(), done: false },
@@ -108,6 +112,7 @@ mod tests {
         assert!(n.contains("- Mac only\n- Cut MCP if late"));
         assert!(n.contains("- [x] Send the DMG (Fabian)"));
         assert!(n.contains("- [ ] Write the README (Lena)"));
+        assert!(n.contains("\nWith: Lena, Max\n"));
     }
 
     #[test]
