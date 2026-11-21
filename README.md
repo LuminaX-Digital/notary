@@ -72,7 +72,7 @@ The script signs the helper program first and the app second, uses the hardened 
 
 ## Privacy
 
-Audio, transcripts and the model all stay on your computer. Notary goes online only to download a model when you press Download.
+Audio, transcripts and the model all stay on your computer. Notary goes online only when you ask it to: to download a model when you press Download, and to ask github.com for a newer version when you press Check for updates.
 
 ## Licence
 
