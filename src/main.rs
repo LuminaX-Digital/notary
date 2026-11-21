@@ -1,6 +1,8 @@
 mod data;
+mod ask;
 mod engine;
 mod models;
+mod search;
 mod store;
 mod summarizer;
 mod theme;
@@ -10,7 +12,7 @@ use engine::{Event, Recording, Source};
 use models::{Download, Kind, Progress};
 use futures::StreamExt;
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, FontWeight, IntoElement, Render, ScrollHandle,
+    AnyElement, App, Application, Bounds, FocusHandle, KeyDownEvent, Context, FontWeight, IntoElement, Render, ScrollHandle,
     SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, relative,
     rgb, size,
 };
@@ -30,7 +32,78 @@ enum Dl {
     Failed(String),
 }
 
+struct Qa {
+    question: SharedString,
+    answer: QaState,
+}
+
+enum QaState {
+    Pending,
+    Done { text: SharedString, sources: Vec<(usize, i64, SharedString)> },
+    Failed(SharedString),
+}
+
+enum Edit {
+    Nothing,
+    Changed,
+    Submit,
+    Escape,
+}
+
+/// Applies one key press to a one-line text: typing, backspace (Option: a word, Command: all), paste.
+fn edit_text(buf: &mut String, ev: &KeyDownEvent, cx: &App) -> Edit {
+    let k = &ev.keystroke;
+    let m = k.modifiers;
+    match k.key.as_str() {
+        "enter" => return Edit::Submit,
+        "escape" => return Edit::Escape,
+        "backspace" => {
+            if m.platform {
+                buf.clear();
+            } else if m.alt {
+                while buf.ends_with(char::is_whitespace) {
+                    buf.pop();
+                }
+                while !buf.is_empty() && !buf.ends_with(char::is_whitespace) {
+                    buf.pop();
+                }
+            } else {
+                buf.pop();
+            }
+            return Edit::Changed;
+        }
+        "v" if m.platform => {
+            return match cx.read_from_clipboard().and_then(|c| c.text()) {
+                Some(text) => {
+                    buf.push_str(&text.replace(['\n', '\r'], " "));
+                    Edit::Changed
+                }
+                None => Edit::Nothing,
+            };
+        }
+        _ => {}
+    }
+    if m.control || m.platform {
+        return Edit::Nothing;
+    }
+    match &k.key_char {
+        Some(c) if !c.chars().any(char::is_control) => {
+            buf.push_str(c);
+            Edit::Changed
+        }
+        _ => Edit::Nothing,
+    }
+}
+
 struct Notary {
+    ask_open: bool,
+    search: String,
+    focus_search: FocusHandle,
+    ask_input: String,
+    focus_ask: FocusHandle,
+    qa: Vec<Qa>,
+    asking: bool,
+    ask_scroll: ScrollHandle,
     setup_open: bool,
     downloads: [Dl; 2],
     store: Option<Store>,
@@ -49,7 +122,7 @@ fn clock(secs: f32) -> String {
 }
 
 impl Notary {
-    fn new() -> Self {
+    fn new(cx: &mut Context<Self>) -> Self {
         let mut status: SharedString = "Ready".into();
         let (store, meetings) = match Store::open().and_then(|s| s.load_meetings().map(|m| (s, m))) {
             Ok((s, m)) => (Some(s), m),
@@ -59,6 +132,14 @@ impl Notary {
             }
         };
         Self {
+            ask_open: false,
+            search: String::new(),
+            focus_search: cx.focus_handle(),
+            ask_input: String::new(),
+            focus_ask: cx.focus_handle(),
+            qa: Vec::new(),
+            asking: false,
+            ask_scroll: ScrollHandle::new(),
             setup_open: models::find(Kind::Speech).is_none(),
             downloads: [Dl::Idle, Dl::Idle],
             store,
@@ -414,15 +495,26 @@ impl Notary {
             .border_r_1()
             .border_color(rgb(t.line))
             .child(
-                glyph("\u{25a4}", !self.setup_open)
+                glyph("\u{25a4}", !self.setup_open && !self.ask_open)
                     .id("nav-meetings")
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.setup_open = false;
+                        this.ask_open = false;
                         cx.notify();
                     })),
             )
-            .child(glyph("\u{2315}", false))
+            .child(
+                glyph("\u{2315}", self.ask_open && !self.setup_open)
+                    .id("nav-ask")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.setup_open = false;
+                        this.ask_open = true;
+                        window.focus(&this.focus_ask);
+                        cx.notify();
+                    })),
+            )
             .child(glyph("\u{25a2}", false))
             .child(div().flex_1())
             .child(
@@ -436,10 +528,162 @@ impl Notary {
             )
     }
 
-    fn list(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn search_field(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus_search.is_focused(window);
+        let empty = self.search.is_empty();
+        let shown: SharedString = if empty { "Search meetings".into() } else { self.search.clone().into() };
+        div()
+            .id("search")
+            .track_focus(&self.focus_search)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_search_key(ev, cx)))
+            .on_click(cx.listener(|this, _, window, cx| {
+                window.focus(&this.focus_search);
+                cx.notify();
+            }))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px(px(10.))
+            .py(px(7.))
+            .rounded(px(8.))
+            .bg(rgb(t.rail))
+            .border_1()
+            .border_color(rgb(if focused { t.accent } else { t.rail }))
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(13.))
+                            .text_color(rgb(if empty { t.faint } else { t.ink }))
+                            .when(!(empty && focused), |d| d.child(shown)),
+                    )
+                    .when(focused, |d| d.child(div().w(px(1.5)).h(px(15.)).bg(rgb(t.accent)))),
+            )
+            .when(!empty, |d| {
+                d.child(
+                    div()
+                        .id("search-clear")
+                        .text_size(px(14.))
+                        .text_color(rgb(t.faint))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.search.clear();
+                            cx.notify();
+                        }))
+                        .child("\u{d7}"),
+                )
+            })
+    }
+
+    fn on_search_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        match edit_text(&mut self.search, ev, cx) {
+            Edit::Escape => self.search.clear(),
+            Edit::Nothing => return,
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn on_ask_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        match edit_text(&mut self.ask_input, ev, cx) {
+            Edit::Submit => return self.submit_question(cx),
+            Edit::Escape => self.ask_input.clear(),
+            Edit::Nothing => return,
+            Edit::Changed => {}
+        }
+        cx.notify();
+    }
+
+    fn open_meeting(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(i) = self.meetings.iter().position(|m| m.id == id) {
+            self.selected = i;
+            self.ask_open = false;
+            self.setup_open = false;
+            self.confirm_delete = None;
+            cx.notify();
+        }
+    }
+
+    fn submit_question(&mut self, cx: &mut Context<Self>) {
+        let question = self.ask_input.trim().to_string();
+        if question.is_empty() || self.asking {
+            return;
+        }
+        let Some(model) = summarizer::model_path() else {
+            self.ask_open = false;
+            self.setup_open = true;
+            self.status = "Download the summary model to ask questions".into();
+            cx.notify();
+            return;
+        };
+        self.ask_input.clear();
+        let sources = ask::retrieve(&self.meetings, &question, 6);
+        let slot = self.qa.len();
+        if sources.is_empty() {
+            let text = if summarizer::detect_language(&question) == "German" {
+                "Dazu habe ich in deinen Meetings nichts gefunden. Versuche andere Worte oder nimm das Meeting zuerst auf."
+            } else {
+                "I couldn't find anything about that in your meetings. Try other words, or record the meeting first."
+            };
+            self.qa.push(Qa { question: question.into(), answer: QaState::Done { text: text.into(), sources: Vec::new() } });
+            self.ask_scroll.scroll_to_bottom();
+            cx.notify();
+            return;
+        }
+        self.qa.push(Qa { question: question.clone().into(), answer: QaState::Pending });
+        self.asking = true;
+        let refs: Vec<(i64, String)> = sources.iter().map(|s| (s.meeting_id, format!("{} \u{b7} {}", s.title, s.when))).collect();
+        let rx = ask::answer(model, question, &sources);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |this, cx| this.apply_answer(slot, refs, result, cx));
+        })
+        .detach();
+        self.ask_scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn apply_answer(
+        &mut self,
+        slot: usize,
+        refs: Vec<(i64, String)>,
+        result: Result<anyhow::Result<String>, futures::channel::oneshot::Canceled>,
+        cx: &mut Context<Self>,
+    ) {
+        self.asking = false;
+        let answer = match result {
+            Ok(Ok(text)) => {
+                let mut sources: Vec<(usize, i64, SharedString)> = Vec::new();
+                for n in ask::cited(&text, refs.len()) {
+                    let (id, label) = &refs[n - 1];
+                    sources.push((n, *id, label.clone().into()));
+                }
+                QaState::Done { text: text.into(), sources }
+            }
+            Ok(Err(e)) => QaState::Failed(format!("{e:#}").into()),
+            Err(_) => QaState::Failed("The answer was interrupted".into()),
+        };
+        if let Some(qa) = self.qa.get_mut(slot) {
+            qa.answer = answer;
+        }
+        self.ask_scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn list(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let terms = search::terms(&self.search);
         let mut items = div().id("meetings").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().px(px(6.)).pb(px(10.));
         let mut last_day = String::new();
+        let mut shown = 0;
         for (i, m) in self.meetings.iter().enumerate() {
+            let Some(hit) = search::search(m, &terms) else { continue };
+            shown += 1;
             let day = m.day_label();
             if day != last_day {
                 items = items.child(
@@ -453,7 +697,11 @@ impl Notary {
                 );
                 last_day = day;
             }
-            let active = i == self.selected;
+            let active = i == self.selected && !self.ask_open && !self.setup_open;
+            let sub: SharedString = match hit.snippet {
+                Some(s) => s.into(),
+                None => m.sub(),
+            };
             items = items.child(
                 div()
                     .id(("meeting", i))
@@ -468,6 +716,8 @@ impl Notary {
                     .hover(|d| d.bg(rgb(if active { t.accent_soft } else { t.rail })))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected = i;
+                        this.ask_open = false;
+                        this.setup_open = false;
                         this.confirm_delete = None;
                         cx.notify();
                     }))
@@ -493,13 +743,18 @@ impl Notary {
                                     .child(m.time()),
                             ),
                     )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(12.))
-                            .text_color(rgb(t.soft))
-                            .child(m.sub()),
-                    ),
+                    .child(div().truncate().text_size(px(12.)).text_color(rgb(t.soft)).child(sub)),
+            );
+        }
+        if shown == 0 && !terms.is_empty() {
+            items = items.child(
+                div()
+                    .px(px(10.))
+                    .py(px(16.))
+                    .text_size(px(13.))
+                    .line_height(px(20.))
+                    .text_color(rgb(t.faint))
+                    .child("No meeting matches. Try fewer or other words."),
             );
         }
 
@@ -518,18 +773,172 @@ impl Notary {
                     .py(px(12.))
                     .border_b_1()
                     .border_color(rgb(t.line))
-                    .child(
-                        div()
-                            .px(px(10.))
-                            .py(px(7.))
-                            .rounded(px(8.))
-                            .bg(rgb(t.rail))
-                            .text_size(px(13.))
-                            .text_color(rgb(t.faint))
-                            .child("Search meetings, notes, transcript"),
-                    ),
+                    .child(self.search_field(t, window, cx)),
             )
             .child(items)
+    }
+
+    fn ask_body(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let focused = self.focus_ask.is_focused(window);
+        let mut column = div().w_full().max_w(px(660.)).flex().flex_col().gap(px(26.));
+        if self.qa.is_empty() {
+            column = column
+                .child(
+                    div()
+                        .font_family(SERIF)
+                        .text_size(px(26.))
+                        .text_color(rgb(t.ink))
+                        .child("Ask your meetings"),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .line_height(px(22.))
+                        .text_color(rgb(t.soft))
+                        .child("Ask in English or German. Notary looks through your saved meetings and answers from what was said. Everything is worked out on this Mac."),
+                );
+            for (i, example) in ["What did we decide about the MCP server?", "Wer macht bis Freitag was?"].into_iter().enumerate() {
+                column = column.child(
+                    div()
+                        .id(("example", i))
+                        .px(px(14.))
+                        .py(px(10.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(rgb(t.line))
+                        .bg(rgb(t.raised))
+                        .cursor_pointer()
+                        .text_size(px(13.5))
+                        .text_color(rgb(t.soft))
+                        .hover(|h| h.text_color(rgb(t.accent)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.ask_input = example.to_string();
+                            window.focus(&this.focus_ask);
+                            cx.notify();
+                        }))
+                        .child(example),
+                );
+            }
+        }
+        for (slot, qa) in self.qa.iter().enumerate() {
+            let mut block = div().flex().flex_col().gap(px(10.)).child(
+                div().font_family(SERIF).text_size(px(17.)).text_color(rgb(t.ink)).child(qa.question.clone()),
+            );
+            match &qa.answer {
+                QaState::Pending => {
+                    block = block.child(div().text_size(px(13.5)).text_color(rgb(t.faint)).child("Reading your meetings on this Mac"));
+                }
+                QaState::Failed(message) => {
+                    block = block.child(
+                        div().text_size(px(13.5)).line_height(px(21.)).text_color(rgb(t.record)).child(message.clone()),
+                    );
+                }
+                QaState::Done { text, sources } => {
+                    block = block.child(
+                        div().text_size(px(14.)).line_height(px(22.)).text_color(rgb(t.ink)).child(text.clone()),
+                    );
+                    if !sources.is_empty() {
+                        let mut chips = div().flex().flex_wrap().gap(px(8.));
+                        for (n, id, label) in sources {
+                            let id = *id;
+                            chips = chips.child(
+                                div()
+                                    .id(("source", slot * 100 + *n))
+                                    .px(px(10.))
+                                    .py(px(4.))
+                                    .rounded(px(7.))
+                                    .bg(rgb(t.accent_soft))
+                                    .cursor_pointer()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(t.accent))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.open_meeting(id, cx)))
+                                    .child(format!("[{n}] {label}")),
+                            );
+                        }
+                        block = block.child(chips);
+                    }
+                }
+            }
+            column = column.child(block);
+        }
+
+        let empty = self.ask_input.is_empty();
+        let shown: SharedString = if empty { "Ask something about your meetings".into() } else { self.ask_input.clone().into() };
+        let bar = div()
+            .w_full()
+            .max_w(px(660.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(14.))
+            .py(px(10.))
+            .rounded(px(12.))
+            .bg(rgb(t.raised))
+            .border_1()
+            .border_color(rgb(if focused { t.accent } else { t.line }))
+            .child(
+                div()
+                    .id("ask-input")
+                    .track_focus(&self.focus_ask)
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_ask_key(ev, cx)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.focus_ask);
+                        cx.notify();
+                    }))
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(14.))
+                            .text_color(rgb(if empty { t.faint } else { t.ink }))
+                            .when(!(empty && focused), |d| d.child(shown)),
+                    )
+                    .when(focused, |d| d.child(div().w(px(1.5)).h(px(16.)).bg(rgb(t.accent)))),
+            )
+            .child(
+                div()
+                    .id("ask-go")
+                    .flex_none()
+                    .px(px(14.))
+                    .py(px(6.))
+                    .rounded(px(8.))
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .when(self.asking || empty, |d| d.bg(rgb(t.rail)).text_color(rgb(t.faint)))
+                    .when(!self.asking && !empty, |d| {
+                        d.cursor_pointer()
+                            .bg(rgb(t.accent))
+                            .text_color(rgb(t.raised))
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_question(cx)))
+                    })
+                    .child(if self.asking { "Thinking" } else { "Ask" }),
+            );
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("qa")
+                    .track_scroll(&self.ask_scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .px(px(40.))
+                    .py(px(36.))
+                    .child(column),
+            )
+            .child(div().flex_none().flex().justify_center().px(px(40.)).pb(px(18.)).child(bar))
+            .into_any_element()
     }
 
     fn model_row(&self, kind: Kind, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1071,9 +1480,11 @@ impl Notary {
             )
     }
 
-    fn view(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn view(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = if self.setup_open {
             self.setup_body(t, cx)
+        } else if self.ask_open {
+            self.ask_body(t, window, cx)
         } else {
             match self.meetings.get(self.selected) {
                 Some(m) => self.meeting_body(m, t, cx),
@@ -1108,8 +1519,8 @@ impl Render for Notary {
                     .min_h_0()
                     .flex()
                     .child(self.rail(&t, cx))
-                    .child(self.list(&t, cx))
-                    .child(self.view(&t, cx)),
+                    .child(self.list(&t, window, cx))
+                    .child(self.view(&t, window, cx)),
             )
     }
 }
@@ -1128,7 +1539,7 @@ fn main() {
                 window_min_size: Some(size(px(860.), px(520.))),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Notary::new()),
+            |_, cx| cx.new(|cx| Notary::new(cx)),
         )
         .unwrap();
         cx.activate(true);

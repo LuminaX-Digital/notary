@@ -17,7 +17,8 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 | Meetings saved on this Mac, with delete | Works |
 | Microphone (your own voice, macOS 15 or newer) | Built, needs more testing |
 | Summaries, titles and next steps you can tick off, in English or German | Works |
-| "Ask across meetings" and search | Planned |
+| Search across titles, transcripts and notes | Works |
+| Ask questions across all meetings, answered with sources, in English or German | Works |
 | Speaker names | Planned |
 | Windows and Linux | Not planned for v1 |
 
@@ -42,6 +43,12 @@ Models are stored in `~/Library/Application Support/Notary/models`. To use anoth
 If you use an outbound firewall such as LuLu or Little Snitch, allow Notary to connect to huggingface.co when it asks, or the download waits.
 
 On first use macOS asks for Screen Recording permission, and for microphone access on macOS 15 or newer. Notary uses them only to hear the audio your Mac plays and your own voice; it never captures the screen. Use headphones on calls so your microphone does not pick up the other side.
+
+## Search and ask
+
+The box above the meeting list searches titles, transcripts, summaries and next steps; every word you type must appear in the meeting. The magnifier in the sidebar opens Ask: type a question in English or German, press Enter, and Notary finds the passages that matter, lets the local model answer from them only, and shows which meetings the answer came from. If nothing in your meetings matches, it says so instead of guessing.
+
+The text fields are simple for now: typing, Backspace (Option for a word, Command for everything), Command-V to paste, Escape to clear. There is no cursor movement or selection yet.
 
 ## Package as an app
 

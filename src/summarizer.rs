@@ -54,28 +54,34 @@ pub fn detect_language(text: &str) -> &'static str {
     if de > en { "German" } else { "English" }
 }
 
-fn run(model: &PathBuf, transcript: &str) -> Result<Notes> {
+/// Runs the helper program in `mode` ("notes" or "ask") and returns what it wrote.
+pub fn run_helper(model: &PathBuf, language: &str, mode: &str, input: &str) -> Result<String> {
     let mut child = Command::new(helper_path()?)
         .arg(model)
-        .arg(detect_language(transcript))
+        .arg(language)
+        .arg(mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("could not start the summary helper")?;
+        .context("could not start the language model helper")?;
     child
         .stdin
         .take()
         .context("no stdin")?
-        .write_all(transcript.as_bytes())
-        .context("could not hand the transcript to the summary helper")?;
+        .write_all(input.as_bytes())
+        .context("could not hand the text to the language model helper")?;
     let output = child.wait_with_output()?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error");
-        bail!("summary failed: {last}");
+        bail!("the language model failed: {last}");
     }
-    let notes = parse(&String::from_utf8_lossy(&output.stdout));
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run(model: &PathBuf, transcript: &str) -> Result<Notes> {
+    let notes = parse(&run_helper(model, detect_language(transcript), "notes", transcript)?);
     if notes.sections.is_empty() && notes.actions.is_empty() {
         bail!("the model returned nothing usable");
     }

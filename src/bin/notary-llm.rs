@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const MAX_NEW_TOKENS: usize = 900;
+const MAX_NEW_TOKENS_ASK: usize = 400;
 const BATCH: usize = 2048;
 const MAX_TRANSCRIPT_CHARS: usize = 48_000;
 const HEAD_CHARS: usize = 12_000;
@@ -46,6 +47,10 @@ const FORMAT_DE: &str = "Schreibe die Notizen genau in diesem Format und lasse d
 
 Lass DECISIONS oder NEXT STEPS komplett weg, wenn es nichts einzutragen gibt. Schreibe niemals Platzhalter wie 'Keine'. Schreibe alles auf Deutsch.";
 
+const ASK_SYSTEM_EN: &str = "You answer questions about the user's own meetings. Use only the numbered sources. After every claim, cite the source it comes from, like [1] or [2]. If the sources do not contain the answer, say so in one sentence and do not guess. Answer in at most 4 short sentences, in English.";
+
+const ASK_SYSTEM_DE: &str = "Du beantwortest Fragen zu den eigenen Besprechungen des Nutzers. Nutze nur die nummerierten Quellen. Nenne nach jeder Aussage die Quelle, zum Beispiel [1] oder [2]. Wenn die Quellen die Antwort nicht enthalten, sage das in einem Satz und rate nicht. Antworte in h\u{f6}chstens 4 kurzen S\u{e4}tzen auf Deutsch.";
+
 fn shorten(transcript: &str) -> String {
     if transcript.len() <= MAX_TRANSCRIPT_CHARS {
         return transcript.to_string();
@@ -64,6 +69,8 @@ fn shorten(transcript: &str) -> String {
 fn main() -> Result<()> {
     let model_path = std::env::args().nth(1).context("usage: notary-llm <model.gguf> [language]")?;
     let language = std::env::args().nth(2).unwrap_or_else(|| "the language of the transcript".into());
+    let ask = std::env::args().nth(3).as_deref() == Some("ask");
+    let max_new = if ask { MAX_NEW_TOKENS_ASK } else { MAX_NEW_TOKENS };
     let mut transcript = String::new();
     std::io::stdin().read_to_string(&mut transcript)?;
     if transcript.trim().is_empty() {
@@ -77,10 +84,15 @@ fn main() -> Result<()> {
     } else {
         (SYSTEM, "Transcript", format!("{FORMAT}\n\nWrite everything in {language}. Only the marker words stay in English."))
     };
-    let prompt = format!(
-        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{label}:\n{}\n\n{format}<|im_end|>\n<|im_start|>assistant\n",
-        shorten(&transcript)
-    );
+    let prompt = if ask {
+        let system = if german { ASK_SYSTEM_DE } else { ASK_SYSTEM_EN };
+        format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{transcript}<|im_end|>\n<|im_start|>assistant\n")
+    } else {
+        format!(
+            "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{label}:\n{}\n\n{format}<|im_end|>\n<|im_start|>assistant\n",
+            shorten(&transcript)
+        )
+    };
 
     let mut backend = LlamaBackend::init()?;
     backend.void_logs();
@@ -89,7 +101,7 @@ fn main() -> Result<()> {
     let vocab = model.vocab();
     let tokens = vocab.tokenize(prompt.as_bytes(), vocab.should_add_bos(), true);
 
-    let n_ctx = (tokens.len() + MAX_NEW_TOKENS + 64) as u32;
+    let n_ctx = (tokens.len() + max_new + 64) as u32;
     let mut ctx = model
         .new_context(&backend, LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx)).with_n_batch(BATCH as u32))
         .context("could not create the model context")?;
@@ -109,7 +121,7 @@ fn main() -> Result<()> {
 
     let mut sampler = LlamaSampler::chain_simple([LlamaSampler::top_p(0.9, 1), LlamaSampler::temp(0.3), LlamaSampler::dist(42)]);
     let mut output: Vec<u8> = Vec::new();
-    for _ in 0..MAX_NEW_TOKENS {
+    for _ in 0..max_new {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         if vocab.is_eog(token) {
             break;
