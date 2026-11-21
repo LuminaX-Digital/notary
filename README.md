@@ -19,8 +19,10 @@ Free and open source (MIT). Written in Rust with [GPUI](https://crates.io/crates
 | Meetings saved on this Mac, with delete | Works |
 | Microphone (your own voice, macOS 15 or newer) | Built, needs more testing |
 | Summaries, titles and next steps you can tick off, in English or German | Works |
-| Search across titles, transcripts and notes | Works |
+| Search across titles, transcripts and notes, with a real text field (cursor, selection, copy and paste) | Works |
 | Ask questions across all meetings, answered with sources, in English or German | Works |
+| Ask finds passages by meaning as well as by words (optional 131 MB model) | Works |
+| Manual update check (contacts github.com only when you press it) | Works |
 | Speaker names | Planned |
 | Windows and Linux | Not planned for v1 |
 
@@ -38,7 +40,7 @@ cd notary
 cargo run --release
 ```
 
-On first launch Notary shows a setup screen. It downloads two models from huggingface.co only when you press Download: speech recognition (574 MB, required) and summaries (2.5 GB, optional). Downloads can be cancelled and resumed, and each file is checked against its official SHA-256 before it is used.
+On first launch Notary shows a setup screen. It downloads up to three models from huggingface.co, each only when you press Download: speech recognition (574 MB, required), summaries (2.5 GB, optional) and search by meaning (131 MB, optional). Downloads can be cancelled and resumed, and each file is checked against its official SHA-256 before it is used.
 
 Models are stored in `~/Library/Application Support/Notary/models`. To use another folder, or to install models by hand on an offline Mac, set `NOTARY_MODELS_DIR`, or point `NOTARY_MODEL` and `NOTARY_LLM` at the files. Summaries run in a separate helper program (`notary-llm`) that starts only while a summary is written.
 
@@ -50,7 +52,9 @@ On first use macOS asks for Screen Recording permission, and for microphone acce
 
 The box above the meeting list searches titles, transcripts, summaries and next steps; every word you type must appear in the meeting. The magnifier in the sidebar opens Ask: type a question in English or German, press Enter, and Notary finds the passages that matter, lets the local model answer from them only, and shows which meetings the answer came from. If nothing in your meetings matches, it says so instead of guessing.
 
-The text fields are simple for now: typing, Backspace (Option for a word, Command for everything), Command-V to paste, Escape to clear. There is no cursor movement or selection yet.
+Text fields support the cursor keys, Option for word jumps, Command for line start and end, Shift to select, and Command-A, C, X and V. Escape clears the field.
+
+With the optional "Search by meaning" model installed, Ask also finds passages that share no word with your question, so a German question about "Berechtigungen" finds an English talk about "permissions". Without it, Ask matches words only.
 
 ## Package as an app
 
