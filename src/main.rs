@@ -1,6 +1,7 @@
 mod data;
 mod ask;
 mod engine;
+mod export;
 mod input;
 mod models;
 mod search;
@@ -10,7 +11,7 @@ mod summarizer;
 mod theme;
 mod updates;
 
-use data::{Action, Meeting, Speaker, line};
+use data::{Action, Folder, Meeting, Speaker, line};
 use engine::{Event, Recording, Source};
 use input::{Outcome, TextInput};
 use models::{Download, Kind, Progress};
@@ -85,6 +86,18 @@ fn field_text(input: &TextInput, placeholder: &'static str, max_chars: usize, si
 }
 
 struct Notary {
+    folders: Vec<Folder>,
+    folder_filter: Option<i64>,
+    adding_folder: bool,
+    new_folder: TextInput,
+    focus_folder: FocusHandle,
+    confirm_folder_delete: bool,
+    moving: bool,
+    renaming: bool,
+    rename_input: TextInput,
+    focus_rename: FocusHandle,
+    note_input: TextInput,
+    focus_note: FocusHandle,
     update_state: UpdateState,
     ask_open: bool,
     search: TextInput,
@@ -121,7 +134,20 @@ impl Notary {
                 (None, Vec::new())
             }
         };
+        let folders = store.as_ref().and_then(|s| s.load_folders().ok()).unwrap_or_default();
         Self {
+            folders,
+            folder_filter: None,
+            adding_folder: false,
+            new_folder: TextInput::default(),
+            focus_folder: cx.focus_handle(),
+            confirm_folder_delete: false,
+            moving: false,
+            renaming: false,
+            rename_input: TextInput::default(),
+            focus_rename: cx.focus_handle(),
+            note_input: TextInput::default(),
+            focus_note: cx.focus_handle(),
             update_state: UpdateState::Idle,
             ask_open: false,
             search: TextInput::default(),
@@ -250,6 +276,41 @@ impl Notary {
             }
         }
         cx.notify();
+    }
+
+    fn copy_notes(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(m) = self.meetings.iter().find(|m| m.id == id) {
+            cx.write_to_clipboard(ClipboardItem::new_string(export::notes_markdown(m)));
+            self.status = "Notes copied".into();
+            cx.notify();
+        }
+    }
+
+    fn copy_transcript(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(m) = self.meetings.iter().find(|m| m.id == id) {
+            cx.write_to_clipboard(ClipboardItem::new_string(export::transcript_text(m)));
+            self.status = "Transcript copied".into();
+            cx.notify();
+        }
+    }
+
+    fn save_markdown(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(m) = self.meetings.iter().find(|m| m.id == id) else { return };
+        let (name, text) = (export::file_name(m), export::full_markdown(m));
+        let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Documents");
+        let rx = cx.prompt_for_new_path(&dir, Some(&name));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = rx.await else { return };
+            let message = match std::fs::write(&path, text) {
+                Ok(()) => format!("Saved {}", path.display()),
+                Err(e) => format!("Could not save: {e}"),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.status = message.into();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn check_updates(&mut self, cx: &mut Context<Self>) {
@@ -605,6 +666,137 @@ impl Notary {
         cx.notify();
     }
 
+    fn on_folder_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        match Self::key_into(&mut self.new_folder, ev, cx) {
+            Outcome::Nothing => return,
+            Outcome::Submit => return self.create_folder(cx),
+            Outcome::Escape => {
+                self.new_folder.clear();
+                self.adding_folder = false;
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn create_folder(&mut self, cx: &mut Context<Self>) {
+        let name = self.new_folder.text().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if self.folders.iter().any(|f| f.name.to_lowercase() == name.to_lowercase()) {
+            self.status = "A folder with that name exists already".into();
+            cx.notify();
+            return;
+        }
+        let id = match &self.store {
+            Some(store) => match store.create_folder(&name) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.status = format!("Could not save: {e:#}").into();
+                    cx.notify();
+                    return;
+                }
+            },
+            None => self.folders.iter().map(|f| f.id).max().unwrap_or(0) + 1,
+        };
+        self.folders.push(Folder { id, name: name.into() });
+        self.folders.sort_by_key(|f| f.name.to_lowercase());
+        self.folder_filter = Some(id);
+        self.adding_folder = false;
+        self.new_folder.clear();
+        cx.notify();
+    }
+
+    fn delete_folder_filter(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.folder_filter else { return };
+        if !self.confirm_folder_delete {
+            self.confirm_folder_delete = true;
+            cx.notify();
+            return;
+        }
+        if let Some(store) = &self.store {
+            let result = store.delete_folder(id);
+            self.save(result);
+        }
+        self.folders.retain(|f| f.id != id);
+        for m in self.meetings.iter_mut().filter(|m| m.folder == Some(id)) {
+            m.folder = None;
+        }
+        self.folder_filter = None;
+        self.confirm_folder_delete = false;
+        self.status = "Folder deleted. Its meetings are still in All.".into();
+        cx.notify();
+    }
+
+    fn move_selected(&mut self, folder: Option<i64>, cx: &mut Context<Self>) {
+        let Some(m) = self.meetings.get_mut(self.selected) else { return };
+        m.folder = folder;
+        let id = m.id;
+        let saved = self.store.as_ref().map(|s| s.set_folder(id, folder));
+        if let Some(result) = saved {
+            self.save(result);
+        }
+        self.moving = false;
+        cx.notify();
+    }
+
+    fn on_rename_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        match Self::key_into(&mut self.rename_input, ev, cx) {
+            Outcome::Nothing => return,
+            Outcome::Submit => return self.finish_rename(cx),
+            Outcome::Escape => self.renaming = false,
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, cx: &mut Context<Self>) {
+        let title = self.rename_input.text().trim().to_string();
+        self.renaming = false;
+        if !title.is_empty() {
+            if let Some(m) = self.meetings.get_mut(self.selected) {
+                m.title = title.clone().into();
+                let id = m.id;
+                let saved = self.store.as_ref().map(|s| s.rename_meeting(id, &title));
+                if let Some(result) = saved {
+                    self.save(result);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_note_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        match Self::key_into(&mut self.note_input, ev, cx) {
+            Outcome::Nothing => return,
+            Outcome::Submit => return self.add_note(cx),
+            Outcome::Escape => self.note_input.clear(),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Saves the typed note as a line of the selected meeting, stamped with the time into the recording.
+    fn add_note(&mut self, cx: &mut Context<Self>) {
+        let text = self.note_input.text().trim().to_string();
+        let Some(m) = self.meetings.get_mut(self.selected) else { return };
+        if text.is_empty() {
+            return;
+        }
+        let ts = if m.live { clock((chrono::Local::now().timestamp() - m.started).max(0) as f32) } else { "--:--".to_string() };
+        let l = line(&ts, "You wrote", Speaker::Note, &text);
+        let id = m.id;
+        let saved = self.store.as_ref().map(|s| s.add_line(id, &l));
+        m.lines.push(l);
+        self.note_input.clear();
+        if let Some(result) = saved {
+            self.save(result);
+        }
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
     fn on_ask_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         match Self::key_into(&mut self.ask_input, ev, cx) {
             Outcome::Nothing => return,
@@ -751,6 +943,9 @@ impl Notary {
         let mut last_day = String::new();
         let mut shown = 0;
         for (i, m) in self.meetings.iter().enumerate() {
+            if self.folder_filter.is_some() && m.folder != self.folder_filter {
+                continue;
+            }
             let Some(hit) = search::search(m, &terms) else { continue };
             shown += 1;
             let day = m.day_label();
@@ -844,7 +1039,79 @@ impl Notary {
                     .border_color(rgb(t.line))
                     .child(self.search_field(t, window, cx)),
             )
+            .child(self.folder_bar(t, window, cx))
             .child(items)
+    }
+
+    fn folder_bar(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let chip = |id: SharedString, label: SharedString, active: bool| {
+            div()
+                .id(id)
+                .flex_none()
+                .px(px(9.))
+                .py(px(3.))
+                .rounded_full()
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .when(active, |d| d.bg(rgb(t.accent_soft)).text_color(rgb(t.accent)))
+                .when(!active, |d| d.bg(rgb(t.rail)).text_color(rgb(t.soft)).hover(|h| h.text_color(rgb(t.accent))))
+                .child(label)
+        };
+        let mut row = div().flex().flex_wrap().items_center().gap(px(6.)).px(px(12.)).py(px(8.)).border_b_1().border_color(rgb(t.line));
+        row = row.child(chip("folder-all".into(), "All".into(), self.folder_filter.is_none()).on_click(cx.listener(|this, _, _, cx| {
+            this.folder_filter = None;
+            this.confirm_folder_delete = false;
+            cx.notify();
+        })));
+        for f in &self.folders {
+            let id = f.id;
+            row = row.child(
+                chip(format!("folder-{id}").into(), f.name.clone(), self.folder_filter == Some(id)).on_click(cx.listener(move |this, _, _, cx| {
+                    this.folder_filter = Some(id);
+                    this.confirm_folder_delete = false;
+                    cx.notify();
+                })),
+            );
+        }
+        row = row.child(chip("folder-new".into(), "+ Folder".into(), self.adding_folder).on_click(cx.listener(|this, _, window, cx| {
+            this.adding_folder = true;
+            window.focus(&this.focus_folder);
+            cx.notify();
+        })));
+        if self.folder_filter.is_some() {
+            row = row.child(
+                div()
+                    .id("folder-delete")
+                    .cursor_pointer()
+                    .text_size(px(11.5))
+                    .text_color(rgb(if self.confirm_folder_delete { t.record } else { t.faint }))
+                    .on_click(cx.listener(|this, _, _, cx| this.delete_folder_filter(cx)))
+                    .child(if self.confirm_folder_delete { "Click again to delete folder" } else { "Delete folder" }),
+            );
+        }
+        let focused = self.focus_folder.is_focused(window);
+        div().flex_none().flex().flex_col().child(row).when(self.adding_folder, |d| {
+            d.child(
+                div().px(px(12.)).pb(px(8.)).child(
+                    div()
+                        .id("new-folder-input")
+                        .track_focus(&self.focus_folder)
+                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_folder_key(ev, cx)))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            window.focus(&this.focus_folder);
+                            cx.notify();
+                        }))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(8.))
+                        .bg(rgb(t.rail))
+                        .border_1()
+                        .border_color(rgb(if focused { t.accent } else { t.rail }))
+                        .overflow_hidden()
+                        .child(field_text(&self.new_folder, "Folder name, then Enter", 28, 13., focused, t)),
+                ),
+            )
+        })
     }
 
     fn ask_body(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1291,13 +1558,13 @@ impl Notary {
             .into_any_element()
     }
 
-    fn meeting_body(&self, m: &Meeting, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn meeting_body(&self, m: &Meeting, t: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let mut transcript = div()
             .id("transcript")
             .track_scroll(&self.scroll)
             .flex_1()
             .min_w_0()
-            .h_full()
+            .min_h_0()
             .overflow_y_scroll()
             .flex()
             .flex_col()
@@ -1501,6 +1768,28 @@ impl Notary {
             .child(summary)
             .when(!m.actions.is_empty(), |d| d.child(actions));
 
+        let note_focused = self.focus_note.is_focused(window);
+        let note_bar = div().flex_none().px(px(24.)).py(px(10.)).border_t_1().border_color(rgb(t.line)).child(
+            div()
+                .id("note-input")
+                .track_focus(&self.focus_note)
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_note_key(ev, cx)))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    window.focus(&this.focus_note);
+                    cx.notify();
+                }))
+                .flex()
+                .items_center()
+                .px(px(12.))
+                .py(px(7.))
+                .rounded(px(8.))
+                .bg(rgb(t.rail))
+                .border_1()
+                .border_color(rgb(if note_focused { t.focus } else { t.rail }))
+                .cursor_pointer()
+                .overflow_hidden()
+                .child(field_text(&self.note_input, "Write your own note and press Enter", 70, 13., note_focused, t)),
+        );
         let confirming = self.confirm_delete == Some(m.id);
         let head = div()
             .flex()
@@ -1518,37 +1807,121 @@ impl Notary {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .child(
+                    .child(if self.renaming {
+                        div()
+                            .id("rename-input")
+                            .track_focus(&self.focus_rename)
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_rename_key(ev, cx)))
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded(px(8.))
+                            .bg(rgb(t.rail))
+                            .border_1()
+                            .border_color(rgb(t.accent))
+                            .overflow_hidden()
+                            .child(field_text(&self.rename_input, "Title", 46, 20., self.focus_rename.is_focused(window), t))
+                            .into_any_element()
+                    } else {
                         div()
                             .font_family(SERIF)
                             .text_size(px(22.))
                             .text_color(rgb(t.ink))
-                            .child(m.title.clone()),
-                    )
+                            .child(m.title.clone())
+                            .into_any_element()
+                    })
                     .child(
                         div()
                             .font_family(MONO)
                             .text_size(px(11.5))
                             .text_color(rgb(t.faint))
                             .child(m.meta()),
-                    ),
+                    )
+                    .when(self.moving, |d| {
+                        let mut chips = div().flex().flex_wrap().gap(px(6.)).pt(px(4.));
+                        let pick = |id: SharedString, label: SharedString, active: bool| {
+                            div()
+                                .id(id)
+                                .px(px(9.))
+                                .py(px(3.))
+                                .rounded_full()
+                                .cursor_pointer()
+                                .text_size(px(11.5))
+                                .when(active, |c| c.bg(rgb(t.accent_soft)).text_color(rgb(t.accent)))
+                                .when(!active, |c| c.bg(rgb(t.rail)).text_color(rgb(t.soft)).hover(|h| h.text_color(rgb(t.accent))))
+                                .child(label)
+                        };
+                        chips = chips.child(
+                            pick("move-none".into(), "No folder".into(), m.folder.is_none())
+                                .on_click(cx.listener(|this, _, _, cx| this.move_selected(None, cx))),
+                        );
+                        for f in &self.folders {
+                            let fid = f.id;
+                            chips = chips.child(
+                                pick(format!("move-{fid}").into(), f.name.clone(), m.folder == Some(fid))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.move_selected(Some(fid), cx))),
+                            );
+                        }
+                        if self.folders.is_empty() {
+                            chips = chips.child(div().text_size(px(11.5)).text_color(rgb(t.faint)).child("Create a folder first with + Folder in the list."));
+                        }
+                        d.child(chips)
+                    }),
             )
             .when(!m.live, |d| {
-                d.child(
+                let chip = |id: &'static str, label: &'static str| {
                     div()
-                        .id("delete")
+                        .id(id)
                         .flex_none()
                         .px(px(10.))
                         .py(px(5.))
                         .rounded(px(7.))
                         .cursor_pointer()
                         .text_size(px(12.))
-                        .when(confirming, |b| b.bg(rgb(t.record)).text_color(rgb(0xFFFFFF)))
-                        .when(!confirming, |b| {
-                            b.bg(rgb(t.rail)).text_color(rgb(t.soft)).hover(|h| h.text_color(rgb(t.record)))
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx)))
-                        .child(if confirming { "Click again to delete" } else { "Delete" }),
+                        .bg(rgb(t.rail))
+                        .text_color(rgb(t.soft))
+                        .hover(|h| h.text_color(rgb(t.accent)))
+                        .child(label)
+                };
+                d.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(chip("copy-notes", "Copy notes").on_click(cx.listener(move |this, _, _, cx| this.copy_notes(meeting_id, cx))))
+                        .child(
+                            chip("copy-transcript", "Copy transcript")
+                                .on_click(cx.listener(move |this, _, _, cx| this.copy_transcript(meeting_id, cx))),
+                        )
+                        .child(chip("export-md", "Export").on_click(cx.listener(move |this, _, _, cx| this.save_markdown(meeting_id, cx))))
+                        .child(chip("move", "Move").on_click(cx.listener(|this, _, _, cx| {
+                            this.moving = !this.moving;
+                            cx.notify();
+                        })))
+                        .child(chip("rename", "Rename").on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(m) = this.meetings.get(this.selected) {
+                                this.rename_input.set(m.title.as_ref());
+                                this.renaming = true;
+                                window.focus(&this.focus_rename);
+                                cx.notify();
+                            }
+                        })))
+                        .child(
+                            div()
+                                .id("delete")
+                                .flex_none()
+                                .px(px(10.))
+                                .py(px(5.))
+                                .rounded(px(7.))
+                                .cursor_pointer()
+                                .text_size(px(12.))
+                                .when(confirming, |b| b.bg(rgb(t.record)).text_color(rgb(0xFFFFFF)))
+                                .when(!confirming, |b| {
+                                    b.bg(rgb(t.rail)).text_color(rgb(t.soft)).hover(|h| h.text_color(rgb(t.record)))
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx)))
+                                .child(if confirming { "Click again to delete" } else { "Delete" }),
+                        ),
                 )
             });
 
@@ -1558,7 +1931,14 @@ impl Notary {
             .flex()
             .flex_col()
             .child(head)
-            .child(div().flex_1().min_h_0().flex().child(transcript).child(side))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(div().flex_1().min_w_0().h_full().flex().flex_col().child(transcript).child(note_bar))
+                    .child(side),
+            )
             .into_any_element()
     }
 
@@ -1619,7 +1999,7 @@ impl Notary {
             self.ask_body(t, window, cx)
         } else {
             match self.meetings.get(self.selected) {
-                Some(m) => self.meeting_body(m, t, cx),
+                Some(m) => self.meeting_body(m, t, window, cx),
                 None => self.empty_body(t),
             }
         };

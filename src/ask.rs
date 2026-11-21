@@ -80,8 +80,10 @@ fn chunks(meetings: &[Meeting]) -> Vec<Chunk> {
         let spoken: Vec<String> = m
             .lines
             .iter()
-            .filter(|l| l.who != Speaker::Note)
-            .map(|l| format!("{}: {}", l.name, l.text))
+            .map(|l| match l.who {
+                Speaker::Note => format!("Note written by the user: {}", l.text),
+                _ => format!("{}: {}", l.name, l.text),
+            })
             .collect();
         let mut start = 0;
         while start < spoken.len() {

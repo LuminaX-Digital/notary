@@ -21,7 +21,11 @@ fn db_path() -> Result<PathBuf> {
 
 impl Store {
     pub fn open() -> Result<Self> {
-        let conn = Connection::open(db_path()?).context("could not open the meetings database")?;
+        Self::open_at(&db_path()?)
+    }
+
+    pub fn open_at(path: &std::path::Path) -> Result<Self> {
+        let conn = Connection::open(path).context("could not open the meetings database")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(
@@ -62,6 +66,12 @@ impl Store {
                 done INTEGER NOT NULL DEFAULT 0
             );",
         )?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);")?;
+        let has_folder_column: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name = 'folder_id'", [], |r| r.get(0))?;
+        if has_folder_column == 0 {
+            conn.execute_batch("ALTER TABLE meetings ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL;")?;
+        }
         Ok(Self { conn })
     }
 
@@ -69,10 +79,12 @@ impl Store {
         let mut meetings = Vec::new();
         let mut stmt = self
             .conn
-            .prepare("SELECT id, title, started FROM meetings ORDER BY started DESC")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
+            .prepare("SELECT id, title, started, folder_id FROM meetings ORDER BY started DESC")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<i64>>(3)?))
+        })?;
         for row in rows {
-            let (id, title, started) = row?;
+            let (id, title, started, folder) = row?;
             let mut lines = Vec::new();
             let mut ls = self
                 .conn
@@ -85,6 +97,7 @@ impl Store {
                 lines.push(line(&ts, &name, Speaker::from_db(who), &text));
             }
             let mut meeting = Meeting::new(id, &title, started, false, lines);
+            meeting.folder = folder;
 
             let mut ss = self
                 .conn
@@ -189,8 +202,85 @@ impl Store {
         Ok(())
     }
 
+    pub fn load_folders(&self) -> Result<Vec<crate::data::Folder>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM folders ORDER BY name COLLATE NOCASE")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name) = row?;
+            out.push(crate::data::Folder { id, name: name.into() });
+        }
+        Ok(out)
+    }
+
+    pub fn create_folder(&self, name: &str) -> Result<i64> {
+        self.conn.execute("INSERT INTO folders (name) VALUES (?1)", params![name])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn delete_folder(&self, folder_id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM folders WHERE id = ?1", params![folder_id])?;
+        Ok(())
+    }
+
+    pub fn set_folder(&self, meeting_id: i64, folder_id: Option<i64>) -> Result<()> {
+        self.conn
+            .execute("UPDATE meetings SET folder_id = ?2 WHERE id = ?1", params![meeting_id, folder_id])?;
+        Ok(())
+    }
+
+    pub fn rename_meeting(&self, meeting_id: i64, title: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE meetings SET title = ?2 WHERE id = ?1", params![meeting_id, title])?;
+        Ok(())
+    }
+
     pub fn delete_meeting(&self, meeting_id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM meetings WHERE id = ?1", params![meeting_id])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::Speaker;
+
+    fn store() -> Store {
+        Store::open_at(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn folders_hold_meetings_and_release_them_when_deleted() {
+        let s = store();
+        let m = s.create_meeting("Weekly", 100).unwrap();
+        let f = s.create_folder("Clients").unwrap();
+        s.set_folder(m, Some(f)).unwrap();
+        assert_eq!(s.load_meetings().unwrap()[0].folder, Some(f));
+        assert_eq!(s.load_folders().unwrap().len(), 1);
+        s.delete_folder(f).unwrap();
+        assert_eq!(s.load_meetings().unwrap()[0].folder, None);
+        assert!(s.load_folders().unwrap().is_empty());
+    }
+
+    #[test]
+    fn folder_names_are_unique_and_sorted() {
+        let s = store();
+        s.create_folder("b").unwrap();
+        s.create_folder("A").unwrap();
+        assert!(s.create_folder("b").is_err());
+        let names: Vec<String> = s.load_folders().unwrap().iter().map(|f| f.name.to_string()).collect();
+        assert_eq!(names, vec!["A", "b"]);
+    }
+
+    #[test]
+    fn renaming_and_notes_survive_a_reload() {
+        let s = store();
+        let m = s.create_meeting("New note", 100).unwrap();
+        s.rename_meeting(m, "Budget talk").unwrap();
+        s.add_line(m, &crate::data::line("00:05", "You wrote", Speaker::Note, "Ask about Q3")).unwrap();
+        let loaded = &s.load_meetings().unwrap()[0];
+        assert_eq!(loaded.title.as_ref(), "Budget talk");
+        assert!(loaded.lines[0].who == Speaker::Note);
     }
 }

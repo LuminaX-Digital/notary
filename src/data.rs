@@ -40,8 +40,14 @@ pub struct Action {
     pub done: bool,
 }
 
+pub struct Folder {
+    pub id: i64,
+    pub name: SharedString,
+}
+
 pub struct Meeting {
     pub id: i64,
+    pub folder: Option<i64>,
     pub title: SharedString,
     pub started: i64,
     pub live: bool,
@@ -68,6 +74,7 @@ impl Meeting {
     pub fn new(id: i64, title: &str, started: i64, live: bool, lines: Vec<Line>) -> Self {
         Self {
             id,
+            folder: None,
             title: title.to_string().into(),
             started,
             live,
@@ -78,12 +85,14 @@ impl Meeting {
         }
     }
 
-    /// The spoken lines as "Name: text", the form the summary model reads. Typed notes are left out.
+    /// The lines as "Name: text", the form the summary model reads. Typed notes are included and marked.
     pub fn transcript_text(&self) -> String {
         self.lines
             .iter()
-            .filter(|l| l.who != Speaker::Note)
-            .map(|l| format!("{}: {}\n", l.name, l.text))
+            .map(|l| match l.who {
+                Speaker::Note => format!("Note written by the user: {}\n", l.text),
+                _ => format!("{}: {}\n", l.name, l.text),
+            })
             .collect()
     }
 
