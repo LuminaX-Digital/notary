@@ -56,7 +56,13 @@ The text fields are simple for now: typing, Backspace (Option for a word, Comman
 scripts/bundle.sh
 ```
 
-This builds `dist/Notary.app` and `dist/Notary.dmg`, ad-hoc signed so it runs on your own Mac. Pass `SIGN_ID="Developer ID Application: ..."` to sign for distribution; the script's header lists the notarization commands.
+This builds `dist/Notary.app` and `dist/Notary.dmg`, ad-hoc signed so it runs on your own Mac. To make a copy you can hand to other people, sign it with a Developer ID certificate and notarize it with Apple:
+
+```bash
+SIGN_ID="Developer ID Application: Your Name (TEAMID)" NOTARY_PROFILE=<profile> scripts/bundle.sh
+```
+
+The script signs the helper program first and the app second, uses the hardened runtime, signs the disk image, sends it to Apple, staples the ticket and checks the result with `spctl`. Create the notarization profile once with `xcrun notarytool store-credentials <profile>`. `scripts/make-icon.swift` redraws the app icon.
 
 ## Privacy
 
