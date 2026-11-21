@@ -140,6 +140,8 @@ struct Notary {
     offer: Option<calls::CallApp>,
     ask_stop: bool,
     warned_accessibility: bool,
+    perms: Option<native::Status>,
+    perms_busy: bool,
 }
 
 fn clock(secs: f32) -> String {
@@ -211,6 +213,8 @@ impl Notary {
             offer: None,
             ask_stop: false,
             warned_accessibility: false,
+            perms: None,
+            perms_busy: false,
         }
     }
 
@@ -767,6 +771,7 @@ impl Notary {
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.setup_open = true;
+                        this.refresh_permissions(cx);
                         cx.notify();
                     })),
             )
@@ -833,6 +838,43 @@ impl Notary {
             Outcome::Escape => self.search.clear(),
             _ => {}
         }
+        cx.notify();
+    }
+
+    /// Reads the macOS permissions the helper needs, without asking for any.
+    fn refresh_permissions(&mut self, cx: &mut Context<Self>) {
+        let rx = native::in_background(native::status);
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(status)) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.perms = Some(status);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Shows the macOS permission prompt for `kind`, then reads the permissions again.
+    fn ask_permission(&mut self, kind: &'static str, cx: &mut Context<Self>) {
+        if self.perms_busy {
+            return;
+        }
+        self.perms_busy = true;
+        let rx = native::in_background(move || native::request(kind));
+        cx.spawn(async move |this, cx| {
+            let answer = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                this.perms_busy = false;
+                match answer {
+                    Ok(Ok(status)) => this.perms = Some(status),
+                    Ok(Err(e)) => this.status = format!("Could not ask for permission: {e:#}").into(),
+                    Err(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1583,7 +1625,48 @@ impl Notary {
                         .child(field_text(&self.words_input, "Names and jargon, separated by commas", 60, 13., words_focused, t)),
                 ).child(hint("Helps Notary spell names, products and technical terms the way you do.")),
             );
-        div().flex().flex_col().gap(px(16.)).child(you).child(language)
+        let toggle = |id: &'static str, title: &'static str, text: &'static str, on: bool, field: fn(&mut Settings) -> &mut bool, cx: &mut Context<Self>| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(16.))
+                .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.)).child(label(title)).child(hint(text)))
+                .child(Self::pill(id.into(), if on { "On" } else { "Off" }.into(), on, t).on_click(cx.listener(move |this, _, _, cx| {
+                    let value = field(&mut this.settings);
+                    *value = !*value;
+                    this.persist_settings();
+                    cx.notify();
+                })))
+        };
+        let s = &self.settings;
+        let recording = Self::settings_card(t)
+            .child(div().font_family(SERIF).text_size(px(16.)).text_color(rgb(t.ink)).child("Recording"))
+            .child(toggle("t-audio", "Keep the audio", "Saves what was said and heard next to the transcript, so you can play it back. Stays on this Mac.", s.keep_audio, |s| &mut s.keep_audio, cx))
+            .child(toggle("t-offer", "Offer to record calls", "A card appears when Zoom, Teams, Meet, FaceTime and others start using your microphone.", s.offer_to_record, |s| &mut s.offer_to_record, cx))
+            .child(toggle("t-stop", "Stop when the call ends", "Stops a recording that was started from a call once the call is over and it has been quiet.", s.stop_when_call_ends, |s| &mut s.stop_when_call_ends, cx));
+
+        let perm_row = |title: &'static str, text: &'static str, state: Option<bool>, kind: &'static str, cx: &mut Context<Self>| {
+            let action: AnyElement = match state {
+                Some(true) => div().text_size(px(12.5)).text_color(rgb(t.accent)).child("Allowed").into_any_element(),
+                _ => Self::pill(format!("perm-{kind}").into(), if state.is_none() { "Checking" } else { "Allow" }.into(), true, t)
+                    .on_click(cx.listener(move |this, _, _, cx| this.ask_permission(kind, cx)))
+                    .into_any_element(),
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(16.))
+                .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.)).child(label(title)).child(hint(text)))
+                .child(action)
+        };
+        let p = self.perms.as_ref();
+        let permissions = Self::settings_card(t)
+            .child(div().font_family(SERIF).text_size(px(16.)).text_color(rgb(t.ink)).child("Permissions"))
+            .child(perm_row("Screen recording", "Lets Notary hear your Mac's audio. No picture is ever recorded.", p.map(|p| p.screen), "screen", cx))
+            .child(perm_row("Microphone", "Picks up your own voice.", p.map(|p| p.microphone == "authorized"), "microphone", cx))
+            .child(perm_row("Accessibility", "Reads who is speaking from the Zoom, Teams or Meet window. Nothing else is read.", p.map(|p| p.accessibility), "accessibility", cx))
+            .child(perm_row("Calendar", "Shows your next meetings and names recordings after them.", p.map(|p| p.calendar == "fullAccess"), "calendar", cx));
+        div().flex().flex_col().gap(px(16.)).child(you).child(recording).child(language).child(permissions)
     }
 
     fn model_row(&self, kind: Kind, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
